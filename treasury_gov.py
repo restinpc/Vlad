@@ -2,22 +2,25 @@ import requests
 import json
 import os
 import time
+import re  # Добавили для парсинга
 import concurrent.futures
 import mysql.connector
 from datetime import datetime
 from urllib.parse import urljoin
 from dotenv import load_dotenv
 
-# ========== КОНФИГУРАЦИЯ ==========
+# ========== КОНФИГ ==========
 load_dotenv()
 
 BASE_API_URL = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/"
 OUTPUT_DIR = "treasury_datasets_json"
-PAGE_SIZE = 10000
+METADATA_FILE = "api.txt"
+PAGE_SIZE = 5000
 MAX_WORKERS = 3
-MAX_RETRIES = 10
+MAX_RETRIES = 5
+DB_BATCH_SIZE = 50
 
-# (Словарь)
+# Словарь датасетов
 DATASETS = {
     "Daily_Treasury_Statement_All": "v1/accounting/dts/dts_all",
     "Judgment_Fund_Report": "v2/payments/jfics/jfics_congress_report",
@@ -169,22 +172,70 @@ DATASETS = {
     "TROR_Written_Off": "v2/debt/tror/written_off_delinquent_debt",
 }
 
+# ========== МЕТАДАННЫЕ ==========
+def load_metadata_from_file(filepath):
+   if not os.path.exists(filepath):
+        print(f"⚠️ Файл метаданных {filepath} не найден.")
+        return {}
 
-# ========== БЛОК СКАЧИВАНИЯ ==========
+    metadata_map = {}
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        content = content.replace('\xa0', ' ')
+        chunks = re.split(r'API title:\s*', content)
+
+        for chunk in chunks:
+            if not chunk.strip(): continue
+
+            lines = [L.strip() for L in chunk.splitlines() if L.strip()]
+            if not lines: continue
+
+            title = lines[0]
+
+            base_url = "N/A"
+            for line in lines:
+                if line.startswith("https://"):
+                    base_url = line
+                    break
+
+            if "API endpoints" in chunk:
+                # Разбиваем чанк на до и после "API endpoints"
+                parts = chunk.split("API endpoints")
+                if len(parts) > 1:
+                    endpoint_section = parts[1]
+                    for e_line in endpoint_section.splitlines():
+                        e_line = e_line.strip()
+                        if e_line.startswith('/'):
+       
+                            raw_key = e_line.split()[0]
+                            key = raw_key.lstrip('/')
+
+                            metadata_map[key] = f"{title} | URL: {base_url}"
+
+        print(f"ℹ️ Загружено {len(metadata_map)} описаний из {filepath}")
+        return metadata_map
+
+    except Exception as e:
+        print(f"⚠️ Ошибка чтения {filepath}: {e}")
+        return {}
+
 def fetch_page_robust(full_url, page_num):
     params = {'page[number]': page_num, 'page[size]': PAGE_SIZE, 'format': 'json'}
     attempts = 0
     while attempts < MAX_RETRIES:
         try:
             with requests.Session() as s:
-                resp = s.get(full_url, params=params, timeout=45)
+                resp = s.get(full_url, params=params, timeout=60)
                 if resp.status_code == 429:
-                    time.sleep((attempts + 2) * 2)
+                    time.sleep((attempts + 2) * 5)
                     attempts += 1
                     continue
                 resp.raise_for_status()
                 return resp.json().get('data', [])
-        except Exception:
+        except Exception as e:
+            print(f"   Ошибка стр {page_num}: {e}")
             time.sleep((attempts + 1) * 3)
             attempts += 1
     return None
@@ -193,155 +244,262 @@ def download_dataset_robust(name, endpoint):
     full_url = urljoin(BASE_API_URL, endpoint)
     filename = f"{name}.json"
     filepath = os.path.join(OUTPUT_DIR, filename)
-    if os.path.exists(filepath):
-        print(f"✓ {name}: готов")
+
+    if os.path.exists(filepath) and os.path.getsize(filepath) > 1000:
+        print(f"✓ {name}: уже скачан")
         return True
+
     print(f"🚀 Скачивание: {name}...")
     try:
         with requests.Session() as s:
             resp = s.get(full_url, params={'page[number]': 1, 'page[size]': PAGE_SIZE, 'format': 'json'}, timeout=45)
-            if resp.status_code == 404: return False
+            if resp.status_code == 404:
+                print("   Не найдено (404)")
+                return False
             resp.raise_for_status()
             data_json = resp.json()
-    except Exception:
+    except Exception as e:
+        print(f"   Ошибка инициализации: {e}")
         return False
 
     meta = data_json.get('meta', {})
     total_pages = meta.get('total-pages', 1)
     all_data = data_json.get('data', [])
+
+    print(f"   Всего страниц: {total_pages}")
+
     if total_pages > 1:
         pages_to_fetch = range(2, total_pages + 1)
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_page = {executor.submit(fetch_page_robust, full_url, p): p for p in pages_to_fetch}
             for future in concurrent.futures.as_completed(future_to_page):
                 page_data = future.result()
-                if page_data: all_data.extend(page_data)
+                if page_data:
+                    all_data.extend(page_data)
+                    print(f"   ...получено {len(all_data)} строк", end='\r')
+
     save_json(filepath, all_data, meta)
+    print(f"   Скачано всего: {len(all_data)}")
     return True
+
 
 def save_json(filepath, data, metadata):
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump({'metadata': metadata, 'data': data}, f, ensure_ascii=False, indent=2)
 
-# ========== БЛОК ЗАГРУЗКИ В ОТДЕЛЬНЫЕ ТАБЛИЦЫ ==========
+
+# ========== БАЗЫ ДАННЫХ ==========
 
 def get_db_connection():
     return mysql.connector.connect(
-        host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"), database=os.getenv("DB_NAME")
+        host=os.getenv("DB_HOST"),
+        port=int(os.getenv("DB_PORT", 3306)),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME"),
+        compress=True
     )
 
-def create_table_dynamic(cursor, table_name, sample_data):
-    """Создает таблицу с колонками, соответствующими полям JSON."""
+def create_table_dynamic(cursor, table_name, sample_data, table_comment):
     columns_def = []
     for key in sample_data.keys():
-        # Очищаем имя колонки от пробелов и дефисов
-        safe_col = key.replace("-", "_").replace(" ", "_").replace(".", "").lower()
-        columns_def.append(f"`{safe_col}` TEXT")
+        safe_col = key.replace("-", "_").replace(" ", "_").replace(".", "").replace("/", "_").lower()
+        col_type = "TEXT"
+        columns_def.append(f"`{safe_col}` {col_type}")
 
-    # Собираем SQL
     cols_sql = ",\n".join(columns_def)
+    cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+    safe_comment = table_comment.replace("'", "''")
+
+    # Пробуем COMPRESSED формат - он позволяет хранить данные плотнее
     sql = f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
+        CREATE TABLE {table_name} (
             id INT AUTO_INCREMENT PRIMARY KEY,
             {cols_sql},
             loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        ) ENGINE=InnoDB 
+          DEFAULT CHARSET=utf8mb4 
+          ROW_FORMAT=COMPRESSED 
+          KEY_BLOCK_SIZE=8
+          COMMENT='{safe_comment}';
     """
     try:
         cursor.execute(sql)
     except mysql.connector.Error as err:
-        print(f"⚠️ Ошибка создания {table_name}: {err}")
+        print(f"⚠️ Ошибка создания (COMPRESSED) {table_name}: {err}")
 
-def load_file_to_separate_table(filename):
+def load_file_to_db(filename, metadata_map):
+    dataset_key = filename.replace(".json", "")
+    base_table_name = f"vlad_tr_{dataset_name_lower(dataset_key)}"[:50]  # Чуть короче, чтобы влез суффикс
+
+    api_path = DATASETS.get(dataset_key, "")
+    endpoint_suffix = api_path.split('/')[-1] if api_path else ""
+    meta_info = metadata_map.get(endpoint_suffix, "Description not found")
+    full_comment = f"Feed: {dataset_key} | {meta_info}"[:2000]
+
+    # Простая проверка: если главная таблица есть, считаем, что всё ок
+    # (Для разделенных таблиц это не совсем точно, но для скорости пойдет)
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"SHOW TABLES LIKE '{base_table_name}'")
+        if cursor.fetchone():
+            cursor.execute(f"SELECT COUNT(*) FROM {base_table_name}")
+            if cursor.fetchone()[0] > 0:
+                cursor.close();
+                conn.close()
+                return
+
+        # Проверим первую часть, если таблица была разбита
+        cursor.execute(f"SHOW TABLES LIKE '{base_table_name}_part_1'")
+        if cursor.fetchone():
+            cursor.execute(f"SELECT COUNT(*) FROM {base_table_name}_part_1")
+            if cursor.fetchone()[0] > 0:
+                cursor.close();
+                conn.close()
+                return
+        cursor.close();
+        conn.close()
+    except:
+        pass
+
     filepath = os.path.join(OUTPUT_DIR, filename)
-    dataset_name = filename.replace(".json", "").lower()
-
-    # Формируем имя таблицы: vlad_treasury_ + имя_файла
-    table_name = f"vlad_treasury_{dataset_name}"[:64]
-
-    print(f"📥 {dataset_name} -> таблица `{table_name}`")
+    print(f"📥 {dataset_key} -> таблица `{base_table_name}`")
 
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = json.load(f)
             data = content.get('data', [])
-    except Exception:
+    except Exception as e:
+        print(f"   Ошибка чтения: {e}");
         return
 
-    if not data:
-        print("   (пусто)")
+    if not data: print("   (пусто)"); return
+
+    keys = list(data[0].keys())
+
+    # === ПОПЫТКА 1: Обычная загрузка ===
+    if try_load_table(base_table_name, keys, data, full_comment):
         return
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    # === ПОПЫТКА 2: Разделение на части (Split) ===
+    print(f"⚠️ Таблица {base_table_name} слишком широкая. Разбиваем на части...")
 
+    # Разбиваем колонки на группы по 60 штук (безопасный лимит для TEXT полей в InnoDB)
+    chunk_size = 60
+    key_chunks = [keys[i:i + chunk_size] for i in range(0, len(keys), chunk_size)]
+
+    for i, key_subset in enumerate(key_chunks, 1):
+        part_name = f"{base_table_name}_part_{i}"
+        part_comment = f"{full_comment} (Part {i}/{len(key_chunks)})"
+        print(f"   ↳ Загрузка части {i}: {part_name} ({len(key_subset)} колонок)")
+
+        # Для частей создаем данные, содержащие только нужные ключи
+        # Это медленнее, но надежнее
+        subset_data = []
+        for row in data:
+            new_row = {k: row.get(k) for k in key_subset}
+            subset_data.append(new_row)
+
+        if not try_load_table(part_name, key_subset, subset_data, part_comment):
+            print(f"❌ Не удалось загрузить даже часть {i}!")
+
+def try_load_table(table_name, keys, data, comment):
+    conn = None
     try:
-        # 1. Создаем таблицу по образу первой строки
-        create_table_dynamic(cursor, table_name, data[0])
+        conn = get_db_connection()
+        cursor = conn.cursor()
 
-        # 2. Готовим SQL вставки
-        keys = list(data[0].keys())
-        safe_keys = [k.replace("-", "_").replace(" ", "_").replace(".", "").lower() for k in keys]
+        # Создаем
+        columns_def = []
+        for key in keys:
+            safe_col = key.replace("-", "_").replace(" ", "_").replace(".", "").replace("/", "_").lower()
+            columns_def.append(f"`{safe_col}` TEXT")  # TEXT для надежности
 
+        cols_sql = ",\n".join(columns_def)
+        cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+        safe_comment = comment.replace("'", "''")
+
+        sql = f"""
+            CREATE TABLE {table_name} (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                {cols_sql},
+                loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC COMMENT='{safe_comment}';
+        """
+        try:
+            cursor.execute(sql)
+        except mysql.connector.Error as err:
+            # Если ошибка размера строки - возвращаем False, чтобы вызвать логику разбиения
+            if err.errno == 1118:
+                return False
+            print(f"⚠️ Ошибка создания {table_name}: {err}")
+            return False
+
+        # Вставляем
+        safe_keys = [k.replace("-", "_").replace(" ", "_").replace(".", "").replace("/", "_").lower() for k in keys]
         placeholders = ", ".join(["%s"] * len(keys))
         columns_str = ", ".join([f"`{k}`" for k in safe_keys])
-
         insert_query = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
 
-        # 3. Вставляем пачками
-        batch_size = 1000
-        batch = []
+        FAST_BATCH = 2000
         total = 0
+        for i in range(0, len(data), FAST_BATCH):
+            chunk = data[i:i + FAST_BATCH]
+            batch_values = []
+            for row in chunk:
+                vals = [json.dumps(row.get(k)) if isinstance(row.get(k), (dict, list)) else (
+                    None if row.get(k) in ["", "null"] else row.get(k)) for k in keys]
+                batch_values.append(tuple(vals))
 
-        for row in data:
-            values = []
-            for k in keys:
-                val = row.get(k)
-                if isinstance(val, (dict, list)): val = json.dumps(val)  # Если внутри вложенный JSON
-                if val == "": val = None
-                values.append(val)
-
-            batch.append(tuple(values))
-
-            if len(batch) >= batch_size:
-                cursor.executemany(insert_query, batch)
+            try:
+                cursor.executemany(insert_query, batch_values)
                 conn.commit()
-                total += len(batch)
-                batch = []
-                print(f"   ... {total}", end='\r')
+                total += len(batch_values)
+                print(f"   🚀 ... {total} / {len(data)}", end='\r')
+            except Exception:
+                # Если сбой, пробуем медленно
+                conn.rollback()
+                for val in batch_values:
+                    try:
+                        cursor.execute(insert_query, val)
+                    except:
+                        pass
+                conn.commit()
+                total += len(batch_values)
 
-        if batch:
-            cursor.executemany(insert_query, batch)
-            conn.commit()
-            total += len(batch)
+        print(f"   ✅ Загружено {total} строк в {table_name}")
+        return True
 
-        print(f"   ✅ Загружено {total} строк")
-
-    except mysql.connector.Error as err:
-        print(f"   ❌ Ошибка SQL: {err}")
+    except Exception as e:
+        print(f"   ❌ Ошибка: {e}")
+        return False
     finally:
-        cursor.close()
-        conn.close()
+        if conn: conn.close()
 
+def dataset_name_lower(name):
+    return name.lower()
 
 def main():
     if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
 
-    # 1. СКАЧИВАНИЕ (вставьте полный DATASETS выше!)
-    print("\n=== ЭТАП 1: ПРОВЕРКА ФАЙЛОВ ===")
+    print(f"База данных: {os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}")
+
+    print("\n=== ЭТАП 0: ЧТЕНИЕ МЕТАДАННЫХ ===")
+    metadata_map = load_metadata_from_file(METADATA_FILE)
+
+    print("\n=== ЭТАП 1: ПРОВЕРКА И СКАЧИВАНИЕ ===")
     for name, endpoint in DATASETS.items():
         download_dataset_robust(name, endpoint)
 
-    # 2. ЗАГРУЗКА
-    print("\n=== ЭТАП 2: ЗАГРУЗКА В ОТДЕЛЬНЫЕ ТАБЛИЦЫ ===")
+    print("\n=== ЭТАП 2: ЗАГРУЗКА В SQL ===")
     files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith(".json")]
+    files.sort()
 
     for filename in files:
-        load_file_to_separate_table(filename)
+        load_file_to_db(filename, metadata_map)
 
-    print("\n🏁 ГОТОВО")
-
+    print("\n🏁 ВСЕ ЗАДАЧИ ВЫПОЛНЕНЫ")
 
 if __name__ == "__main__":
     main()
