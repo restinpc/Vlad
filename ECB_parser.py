@@ -24,6 +24,8 @@ class ECBCollector:
         """Создает подключение к MySQL."""
         return mysql.connector.connect(
             host=os.getenv("DB_HOST"),
+            # Добавляем порт и преобразуем его в число
+            port=int(os.getenv("DB_PORT", 3306)),
             user=os.getenv("DB_USER"),
             password=os.getenv("DB_PASSWORD"),
             database=os.getenv("DB_NAME")
@@ -109,6 +111,7 @@ class ECBCollector:
 
                     content = r.text
 
+                    # В MySQL плейсхолдеры это %s, а не ?
                     cursor.execute("""
                         INSERT INTO vlad_ecb_xml_storage (feed_url, feed_title, xml_content)
                         VALUES (%s, %s, %s)
