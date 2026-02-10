@@ -278,17 +278,43 @@ async def calculate_pure_memory(pair, day, date_str):
 
 @app.get("/")
 async def get_metadata():
+    required_tables = [
+        "vlad_investing_weights_table",  # вы используете именно эту таблицу, а не vlad_weight_codes!
+        "vlad_investing_event_index",
+        "brain_rates_eur_usd",
+        "brain_rates_btc_usd",
+        "brain_rates_eth_usd",
+        "version_microservice"
+    ]
+    brain_table = "vlad_investing_calendar"  # вы читаете из неё, а не из brain_calendar
+
+    async with engine.connect() as conn:
+        # Проверка всех таблиц в одной БД
+        for table in required_tables + [brain_table]:
+            try:
+                await conn.execute(text(f"SELECT 1 FROM `{table}` LIMIT 1"))
+            except Exception as e:
+                return {"status": "error", "error": f"Table {table} inaccessible: {e}"}
+
+        # Чтение версии
+        try:
+            res = await conn.execute(
+                text("SELECT version FROM version_microservice WHERE microservice_id = 25")
+            )
+            row = res.fetchone()
+            version = row[0] if row else 0
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
     return {
+        "status": "ok",
+        "version": f"1.{version}.0",
         "name": "brain-weights-microservice",
-        "version": "2.0.0",
-        "description": "Calculates historical market weights based on cyclical events",
-        "author": "Vlad",
-        "stack": "Python 3 + MySQL (vlad_investing_*)",
-        "endpoints": [
-            {"path": "/", "method": "GET", "desc": "Service metadata"},
-            {"path": "/weights", "method": "GET", "desc": "List of all weight codes"},
-            {"path": "/values", "method": "GET", "params": ["pair", "day", "date"], "desc": "Calculate weight values"}
-        ]
+        "text": "Calculates historical market weights based on cyclical economic events",
+        "metadata": {
+            "author": "Vlad",
+            "stack": "Python 3 + MySQL",
+        }
     }
 
 
@@ -305,6 +331,69 @@ async def get_values(
 ):
     return await calculate_pure_memory(pair, day, date)
 
+@app.post("/patch")
+async def patch_service():
+    service_id = 25
+    async with engine.begin() as conn:  # используем основной engine
+        res = await conn.execute(
+            text("SELECT version FROM version_microservice WHERE microservice_id = :id"),
+            {"id": service_id}
+        )
+        row = res.fetchone()
+        if not row:
+            raise HTTPException(status_code=500, detail=f"Service ID {service_id} not found")
+
+        current_version = row[0]
+
+        if current_version < 1:
+            print("[PATCH] Applying v1...")
+            await conn.execute(
+                text("UPDATE version_microservice SET version = 1 WHERE microservice_id = :id"),
+                {"id": service_id}
+            )
+            current_version = 1
+
+        return {
+            "status": "ok",
+            "from_version": row[0],
+            "to_version": current_version,
+            "message": f"Applied patches up to version {current_version}"
+        }
+
+@app.get("/new_weights")
+async def get_new_weights(code: str = Query(...)):
+    parts = code.split("_")
+    if len(parts) < 3:
+        raise HTTPException(status_code=400, detail="Invalid weight_code format")
+
+    try:
+        target_eid = int(parts[0])
+        target_etype = int(parts[1])
+        target_mval = int(parts[2])
+        target_hshift = int(parts[3]) if len(parts) > 3 else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="All components must be integers")
+
+    async with engine.connect() as conn:  # <-- используем основной engine
+        # Защита от NULL: COALESCE(hour_shift, -999999)
+        query = """
+            SELECT weight_code
+            FROM vlad_investing_weights_table
+            WHERE (EventId, event_type, mode_val, COALESCE(hour_shift, -999999)) 
+                  > (:eid, :etype, :mval, :hshift)
+            ORDER BY EventId, event_type, mode_val, hour_shift IS NULL, hour_shift
+        """
+        res = await conn.execute(
+            text(query),
+            {
+                "eid": target_eid,
+                "etype": target_etype,
+                "mval": target_mval,
+                "hshift": target_hshift if target_hshift is not None else -999999
+            }
+        )
+        rows = res.mappings().all()
+        return {"weights": [r["weight_code"] for r in rows]}
 
 if __name__ == "__main__":
-    uvicorn.run("server_25:app", host="0.0.0.0", port=8888, reload=False, workers=1)
+    uvicorn.run("server_25:app", host="0.0.0.0", port=8890, reload=False, workers=1)

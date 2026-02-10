@@ -11,14 +11,21 @@ import bisect
 
 load_dotenv()
 
+# --- Основная БД (vlad) ---
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "3306")
 DB_NAME = os.getenv("DB_NAME", "vlad")
-DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+DATABASE_URL_VLAD = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-engine = create_async_engine(DATABASE_URL, pool_size=10, echo=False)
+engine_vlad = create_async_engine(DATABASE_URL_VLAD, pool_size=10, echo=False)
+
+# --- БД brain (только для чтения) ---
+DB_NAME_2 = os.getenv("DB_NAME_2", "brain")
+DATABASE_URL_BRAIN = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME_2}"
+
+engine_brain = create_async_engine(DATABASE_URL_BRAIN, pool_size=5, echo=False)
 
 GLOBAL_EXTREMUMS = {}
 GLOBAL_RATES = {}
@@ -53,57 +60,83 @@ def parse_date_string(date_str):
 
 async def preload_all_data():
     print("STARTING FULL DATA LOAD")
-    async with engine.connect() as conn:
+
+    # 1. Загружаем данные из vlad (weight codes, event index)
+    async with engine_vlad.connect() as conn_vlad:
         print("  Loading Weight Codes...")
-        q_weights = "SELECT weight_code FROM vlad_weight_codes"
         try:
-            res = await conn.execute(text(q_weights))
+            res = await conn_vlad.execute(text("SELECT weight_code FROM vlad_weight_codes"))
             rows = res.mappings().all()
             GLOBAL_WEIGHT_CODES.clear()
-            for r in rows:
-                GLOBAL_WEIGHT_CODES.append(r['weight_code'])
+            GLOBAL_WEIGHT_CODES.extend(r['weight_code'] for r in rows)
             print(f"  Loaded {len(GLOBAL_WEIGHT_CODES)} weight codes.")
         except Exception as e:
             print(f"  Weight Codes Load Error: {e}")
 
-        print("  Loading Calendar & Event History...")
-        q_cal = """
-        SELECT i.EventId, c.FullDate as date, i.Importance
-        FROM brain_calendar c
-        JOIN vlad_brain_calendar_event_index i ON c.EventName = i.EventName AND c.Country = i.Country
-        """
-        try:
-            res = await conn.execute(text(q_cal))
-            rows = res.mappings().all()
-            for r in rows:
-                dt = r['date']
-                eid = r['EventId']
-                imp = r['Importance']
-                if eid not in GLOBAL_HISTORY: GLOBAL_HISTORY[eid] = []
-                GLOBAL_HISTORY[eid].append(dt)
-                if dt not in GLOBAL_CALENDAR: GLOBAL_CALENDAR[dt] = []
-                GLOBAL_CALENDAR[dt].append({
-                    'EventId': eid,
-                    'Importance': imp,
-                    'event_date': dt
-                })
-            print(f"  Loaded {len(rows)} calendar entries.")
-        except Exception as e:
-            print(f"  Calendar Load Error: {e}")
+    # 2. Загружаем calendar из brain + join с индексом из vlad
+    async with engine_brain.connect() as conn_brain:
+        async with engine_vlad.connect() as conn_vlad:
+            print("  Loading Calendar & Event History...")
 
-        tables = [
-            "brain_rates_eur_usd", "brain_rates_eur_usd_day",
-            "brain_rates_btc_usd", "brain_rates_btc_usd_day",
-            "brain_rates_eth_usd", "brain_rates_eth_usd_day"
-        ]
+            # Сначала получим весь brain_calendar из brain
+            try:
+                res_cal = await conn_brain.execute(text("SELECT EventName, Country, FullDate FROM brain_calendar"))
+                brain_events = res_cal.mappings().all()
+                print(f"    Fetched {len(brain_events)} events from brain.brain_calendar")
+            except Exception as e:
+                print(f"    Error loading brain_calendar: {e}")
+                return
 
+            # Получим маппинг из vlad_brain_calendar_event_index
+            try:
+                res_idx = await conn_vlad.execute(text(
+                    "SELECT EventName, Country, EventId, Importance FROM vlad_brain_calendar_event_index"
+                ))
+                index_map = {}
+                for r in res_idx.mappings():
+                    key = (r['EventName'], r['Country'])
+                    index_map[key] = {'EventId': r['EventId'], 'Importance': r['Importance']}
+                print(f"    Loaded {len(index_map)} index entries from vlad.vlad_brain_calendar_event_index")
+            except Exception as e:
+                print(f"    Error loading event index: {e}")
+                return
+
+            # Объединяем в памяти (без JOIN между разными БД)
+            matched_rows = 0
+            for event in brain_events:
+                key = (event['EventName'], event['Country'])
+                if key in index_map:
+                    eid = index_map[key]['EventId']
+                    imp = index_map[key]['Importance']
+                    dt = event['FullDate']
+                    if eid not in GLOBAL_HISTORY:
+                        GLOBAL_HISTORY[eid] = []
+                    GLOBAL_HISTORY[eid].append(dt)
+                    if dt not in GLOBAL_CALENDAR:
+                        GLOBAL_CALENDAR[dt] = []
+                    GLOBAL_CALENDAR[dt].append({
+                        'EventId': eid,
+                        'Importance': imp,
+                        'event_date': dt
+                    })
+                    matched_rows += 1
+
+            print(f"  Matched {matched_rows} calendar entries.")
+
+    # 3. Загружаем rates из vlad (они там!)
+    tables = [
+        "brain_rates_eur_usd", "brain_rates_eur_usd_day",
+        "brain_rates_btc_usd", "brain_rates_btc_usd_day",
+        "brain_rates_eth_usd", "brain_rates_eth_usd_day"
+    ]
+
+    async with engine_vlad.connect() as conn_vlad:
         for table in tables:
             print(f"  Loading {table}...")
             GLOBAL_RATES[table] = {}
             GLOBAL_LAST_CANDLES[table] = []
-            q_rates = f"SELECT date, open, close, t1 FROM {table}"
             try:
-                res = await conn.execute(text(q_rates))
+                res = await conn_vlad.execute(text(f"SELECT date, open, close, t1 FROM {table}"))
                 rows = res.mappings().all()
                 sorted_rows = sorted(rows, key=lambda x: x['date'])
                 for r in sorted_rows:
@@ -123,7 +156,7 @@ async def preload_all_data():
                     JOIN {table} t_next ON t_next.date = t1.date + INTERVAL 1 HOUR
                     WHERE t1.{col} {op} t_prev.{col} AND t1.{col} {op} t_next.{col}
                     """
-                    res_ext = await conn.execute(text(q_ext))
+                    res_ext = await conn_vlad.execute(text(q_ext))
                     GLOBAL_EXTREMUMS[table][type_] = {r['date'] for r in res_ext.mappings().all()}
             except Exception as e:
                 print(f"  Error loading {table}: {e}")
@@ -135,7 +168,8 @@ async def preload_all_data():
 async def lifespan(app: FastAPI):
     await preload_all_data()
     yield
-    await engine.dispose()
+    await engine_vlad.dispose()
+    await engine_brain.dispose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -222,44 +256,122 @@ async def calculate_pure_memory(pair, day, date_str):
 
     return {k: round(v, 6) for k, v in raw_result.items() if v != 0}
 
+@app.post("/patch")
+async def patch_service():
+    service_id = 23
+    async with engine_vlad.begin() as conn:
+        res = await conn.execute(
+            text("SELECT version FROM version_microservice WHERE microservice_id = :id"),
+            {"id": service_id}
+        )
+        row = res.fetchone()
+        if not row:
+            raise HTTPException(status_code=500, detail=f"Service ID {service_id} not found")
+
+        current_version = row[0]
+
+        # Патч 0 → 1
+        if current_version < 1:
+            print("[PATCH] Applying v1...")
+            # Нет реальной миграции — только обновление версии
+            await conn.execute(
+                text("UPDATE version_microservice SET version = 1 WHERE microservice_id = :id"),
+                {"id": service_id}
+            )
+            current_version = 1
+
+        return {
+            "status": "ok",
+            "from_version": row[0],
+            "to_version": current_version,
+            "message": f"Applied patches up to version {current_version}"
+        }
 
 @app.get("/")
 async def get_metadata():
-    return {
-        "name": "brain-weights-microservice",
-        "version": "1.0.0",
-        "description": "Calculates historical market weights based on cyclical events",
-        "author": "Vlad",
-        "stack": "Python 3 + MySQL",
-        "endpoints": [
-            {
-                "path": "/",
-                "method": "GET",
-                "desc": "Service metadata"
-            },
-            {
-                "path": "/weights",
-                "method": "GET",
-                "desc": "List of all weight codes"
-            },
-            {
-                "path": "/values",
-                "method": "GET",
-                "params": [
-                    "pair",
-                    "day",
-                    "date"
-                ],
-                "desc": "Calculate weight values"
-            }
-        ]
-    }
+    required_tables_vlad = [
+        "vlad_weight_codes",
+        "vlad_brain_calendar_event_index",
+        "brain_rates_eur_usd",
+        "brain_rates_btc_usd",
+        "brain_rates_eth_usd",
+        "version_microservice"
+    ]
+    brain_table = "brain_calendar"
 
+    # Проверка таблиц в vlad
+    async with engine_vlad.connect() as conn:
+        for table in required_tables_vlad:
+            try:
+                await conn.execute(text(f"SELECT 1 FROM {table} LIMIT 1"))
+            except Exception as e:
+                return {"status": "error", "error": f"vlad.{table} inaccessible: {e}"}
+
+    # Проверка brain_calendar в brain
+    async with engine_brain.connect() as conn:
+        try:
+            await conn.execute(text(f"SELECT 1 FROM {brain_table} LIMIT 1"))
+        except Exception as e:
+            return {"status": "error", "error": f"brain.{brain_table} inaccessible: {e}"}
+
+    # Чтение версии из vlad
+    async with engine_vlad.connect() as conn:
+        try:
+            res = await conn.execute(text("SELECT version FROM version_microservice WHERE microservice_id = 23"))
+            row = res.fetchone()
+            version = row[0] if row else 0
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    return {
+        "status": "ok",
+        "version": f"1.{version}.6",
+        "name": "brain-weights-microservice",
+        "text": "Calculates historical market weights based on cyclical economic events",
+        "metadata": {
+            "author": "Vlad",
+            "stack": "Python 3 + MySQL",
+        }
+    }
 
 @app.get("/weights")
 async def get_weights():
     return {"weights": GLOBAL_WEIGHT_CODES}
 
+
+@app.get("/new_weights")
+async def get_new_weights(code: str = Query(...)):
+    parts = code.split("_")
+    if len(parts) < 3:
+        raise HTTPException(status_code=400, detail="Invalid weight_code format")
+
+    try:
+        target_eid = int(parts[0])
+        target_etype = int(parts[1])
+        target_mval = int(parts[2])
+        target_hshift = int(parts[3]) if len(parts) > 3 else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="All components must be integers")
+
+    async with engine_vlad.connect() as conn:
+        query = """
+            SELECT weight_code
+            FROM vlad_weight_codes
+            WHERE (EventId, event_type, mode_val, COALESCE(hour_shift, -999999)) 
+                  > (:eid, :etype, :mval, :hshift)
+            ORDER BY EventId, event_type, mode_val, hour_shift IS NULL, hour_shift
+        """
+        res = await conn.execute(
+            text(query),
+            {
+                "eid": target_eid,
+                "etype": target_etype,
+                "mval": target_mval,
+                "hshift": target_hshift if target_hshift is not None else -999999
+            }
+        )
+        rows = res.mappings().all()
+        return {"weights": [r["weight_code"] for r in rows]}
 
 @app.get("/values")
 async def get_values(pair: int = Query(1), day: int = Query(0), date: str = Query(...)):
