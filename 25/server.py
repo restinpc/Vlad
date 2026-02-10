@@ -396,4 +396,4 @@ async def get_new_weights(code: str = Query(...)):
         return {"weights": [r["weight_code"] for r in rows]}
 
 if __name__ == "__main__":
-    uvicorn.run("server_25:app", host="0.0.0.0", port=8890, reload=False, workers=1)
+    uvicorn.run("server:app", host="0.0.0.0", port=8890, reload=False, workers=1)
