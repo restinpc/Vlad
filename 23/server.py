@@ -379,4 +379,4 @@ async def get_values(pair: int = Query(1), day: int = Query(0), date: str = Quer
 
 
 if __name__ == "__main__":
-    uvicorn.run("server_23:app", host="0.0.0.0", port=8888, reload=False, workers=1)
+    uvicorn.run("server:app", host="0.0.0.0", port=8888, reload=False, workers=1)
