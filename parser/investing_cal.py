@@ -20,6 +20,7 @@ TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "investing_cal_loader")
 EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
+
 def send_error_trace(exc: Exception, script_name: str = "investing_cal.py"):
     logs = (
         f"Node: {NODE_NAME}\n"
@@ -41,7 +42,8 @@ def send_error_trace(exc: Exception, script_name: str = "investing_cal.py"):
     except Exception as e:
         print(f"⚠️ [POST] Не удалось отправить отчёт: {e}")
 
-# === Аргументы командной строки + .env fallback ===
+
+# === Аргументы командной строки ===
 parser = argparse.ArgumentParser(description="Investing.com Economic Calendar → MySQL")
 parser.add_argument("table_name", help="Имя целевой таблицы в БД")
 parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"), help="Хост базы данных")
@@ -52,7 +54,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"), help="�
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны все параметры подключения к БД (через аргументы или .env)")
+    print("❌ Ошибка: не указаны все параметры подключения к БД")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -76,8 +78,10 @@ START_FALLBACK = date(1970, 1, 1)
 END_DATE_UTC = datetime.now(timezone.utc).date()
 LOOKBACK_DAYS = 7
 
+
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
 
 # ---------- DATE HELPERS ----------
 def add_month(d: date) -> date:
@@ -85,6 +89,7 @@ def add_month(d: date) -> date:
     if m == 12:
         return date(y + 1, 1, 1)
     return date(y, m + 1, 1)
+
 
 def month_ranges(start_d: date, end_d: date) -> List[Tuple[date, date]]:
     cur = date(start_d.year, start_d.month, 1)
@@ -95,6 +100,7 @@ def month_ranges(start_d: date, end_d: date) -> List[Tuple[date, date]]:
         out.append((max(start_d, cur), min(end_d, last_day)))
         cur = nm
     return out
+
 
 # ---------- DB ----------
 class DB:
@@ -143,33 +149,44 @@ class DB:
             (mx,) = cur.fetchone()
             return mx
 
-    def insert_ignore_batch(self, batch: List[Dict[str, Any]]) -> int:
-        if not batch:
-            return 0
+    def upsert_single(self, row: Dict[str, Any]) -> bool:
+        """Возвращает True, если строка была вставлена или обновлена."""
+        update_fields = [
+            "actual", "forecast", "previous",
+            "preliminary", "precision_value",
+            "previous_revised_from", "actual_to_forecast", "revised_to_previous"
+        ]
+        set_clause = ", ".join([f"{col} = VALUES({col})" for col in update_fields])
+
         sql = f"""
-            INSERT IGNORE INTO `{self.table_name}` (
-                occurrence_id, occurrence_time_utc, event_id,
-                currency, importance, event_name,
-                actual, forecast, previous,
-                country_id, category, source, page_link,
-                unit, reference_period,
-                preliminary, precision_value, previous_revised_from,
-                actual_to_forecast, revised_to_previous
-            ) VALUES (
-                %(occurrence_id)s, %(occurrence_time_utc)s, %(event_id)s,
-                %(currency)s, %(importance)s, %(event_name)s,
-                %(actual)s, %(forecast)s, %(previous)s,
-                %(country_id)s, %(category)s, %(source)s, %(page_link)s,
-                %(unit)s, %(reference_period)s,
-                %(preliminary)s, %(precision_value)s, %(previous_revised_from)s,
-                %(actual_to_forecast)s, %(revised_to_previous)s
-            )
+        INSERT INTO `{self.table_name}` (
+            occurrence_id, occurrence_time_utc, event_id,
+            currency, importance, event_name,
+            actual, forecast, previous,
+            country_id, category, source, page_link,
+            unit, reference_period,
+            preliminary, precision_value, previous_revised_from,
+            actual_to_forecast, revised_to_previous
+        ) VALUES (
+            %(occurrence_id)s, %(occurrence_time_utc)s, %(event_id)s,
+            %(currency)s, %(importance)s, %(event_name)s,
+            %(actual)s, %(forecast)s, %(previous)s,
+            %(country_id)s, %(category)s, %(source)s, %(page_link)s,
+            %(unit)s, %(reference_period)s,
+            %(preliminary)s, %(precision_value)s, %(previous_revised_from)s,
+            %(actual_to_forecast)s, %(revised_to_previous)s
+        )
+        ON DUPLICATE KEY UPDATE {set_clause}
         """
+
         with self.get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.executemany(sql, batch)
+            cursor = conn.cursor()
+            cursor.execute(sql, row)
+            # ROW_COUNT() возвращает 1 для INSERT, 2 для UPDATE
+            affected = cursor.rowcount
             conn.commit()
-            return cur.rowcount
+            return affected > 0
+
 
 # ---------- VALUE HELPERS ----------
 def safe_int(v: Any) -> Optional[int]:
@@ -179,6 +196,7 @@ def safe_int(v: Any) -> Optional[int]:
         return int(v)
     except Exception:
         return None
+
 
 def safe_bool(v: Any) -> Optional[bool]:
     if v is None:
@@ -192,6 +210,7 @@ def safe_bool(v: Any) -> Optional[bool]:
         return False
     return None
 
+
 def safe_str(v: Any, max_len: int) -> Optional[str]:
     if v is None:
         return None
@@ -199,6 +218,7 @@ def safe_str(v: Any, max_len: int) -> Optional[str]:
     if s == "":
         return None
     return s[:max_len]
+
 
 def parse_occurrence_time_utc_to_mysql_dt(iso_z: Any) -> Optional[datetime]:
     if not iso_z:
@@ -208,6 +228,7 @@ def parse_occurrence_time_utc_to_mysql_dt(iso_z: Any) -> Optional[datetime]:
         return dt.replace(tzinfo=None)
     except Exception:
         return None
+
 
 # ---------- FETCH ----------
 def build_occ_url(start_d: date, end_d: date, limit: int, cursor: Optional[str]) -> str:
@@ -221,6 +242,7 @@ def build_occ_url(start_d: date, end_d: date, limit: int, cursor: Optional[str])
     if cursor:
         params["cursor"] = cursor
     return f"{SETTINGS['api_occ']}?{urlencode(params)}"
+
 
 def request_json_with_retries(context, url: str, headers: Dict[str, str], tries: int = 4) -> Dict[str, Any]:
     last_err = None
@@ -242,7 +264,9 @@ def request_json_with_retries(context, url: str, headers: Dict[str, str], tries:
             time.sleep(wait)
     raise RuntimeError(f"Failed after {tries} tries: {last_err}")
 
-def fetch_all_pages_for_range(context, start_d: date, end_d: date, limit: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+
+def fetch_all_pages_for_range(context, start_d: date, end_d: date, limit: int) -> Tuple[
+    List[Dict[str, Any]], List[Dict[str, Any]]]:
     headers = {
         "domain-id": str(SETTINGS["domain_id"]),
         "accept": "application/json, text/plain, */*",
@@ -268,6 +292,7 @@ def fetch_all_pages_for_range(context, start_d: date, end_d: date, limit: int) -
             break
         time.sleep(random.uniform(0.3, 0.9))
     return all_occ, all_events
+
 
 def occurrence_to_db_row(o: Dict[str, Any], event_map: Dict[int, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     occ_id = safe_int(o.get("occurrence_id"))
@@ -300,6 +325,7 @@ def occurrence_to_db_row(o: Dict[str, Any], event_map: Dict[int, Dict[str, Any]]
         "revised_to_previous": safe_str(o.get("revised_to_previous"), 16),
     }
 
+
 # ---------- MAIN ----------
 def main() -> int:
     db = DB(args.table_name)
@@ -320,9 +346,10 @@ def main() -> int:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        raise SystemExit("Install: pip install playwright mysql-connector-python python-dotenv && playwright install chromium")
+        raise SystemExit(
+            "Install: pip install playwright mysql-connector-python python-dotenv && playwright install chromium")
 
-    inserted_total = 0
+    processed_total = 0
     seen_total = 0
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -354,13 +381,26 @@ def main() -> int:
                 if row:
                     batch.append(row)
             seen_total += len(batch)
-            inserted = db.insert_ignore_batch(batch)
-            inserted_total += inserted
-            log(f"  rows seen={len(batch)} inserted_new={inserted}")
+
+            # Обрабатываем по одной строке для точного подсчёта
+            for row in batch:
+                if db.upsert_single(row):
+                    processed_total += 1
+
+            log(f"  rows seen={len(batch)} processed (new/updated)={processed_total}")
             time.sleep(random.uniform(0.15, 0.5))
         browser.close()
-    log(f"Done. Seen={seen_total} Inserted_new={inserted_total}")
+
+    # Финальная статистика
+    with db.get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(f"SELECT COUNT(*) FROM `{args.table_name}` WHERE actual IS NOT NULL AND actual != ''")
+        count_actual = cur.fetchone()[0]
+        log(f"Total records with 'actual' value: {count_actual}")
+
+    log(f"Done. Seen={seen_total} Processed (new/updated)={processed_total}")
     return 0
+
 
 if __name__ == "__main__":
     try:
