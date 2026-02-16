@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Парсер новостей Binance Square → MySQL
+Стиль: investing_cal.py (без ограничения на количество новостей)
+"""
 import os
 import sys
 import argparse
@@ -14,6 +20,12 @@ from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
 load_dotenv()
+
+# === Настройка временной директории ===
+# Создаем папку для временных файлов Playwright в текущей директории
+PLAYWRIGHT_TEMP_DIR = os.path.join(os.getcwd(), ".playwright-tmp")
+os.makedirs(PLAYWRIGHT_TEMP_DIR, exist_ok=True)
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = PLAYWRIGHT_TEMP_DIR
 
 # === Конфигурация трассировки ошибок ===
 TRACE_URL = "https://server.brain-project.online/trace.php"
@@ -104,16 +116,22 @@ class DB:
 
     def upsert_single(self, row: Dict[str, Any]) -> bool:
         """
-        Вставляет только новую запись. Существующие пропускает (не обновляет).
+        Вставляет или обновляет запись. Возвращает True, если запись была добавлена или обновлена.
         """
         sql = f"""
-        INSERT IGNORE INTO `{self.table_name}` (link, title, full_text, preview, date, author)
+        INSERT INTO `{self.table_name}` (link, title, full_text, preview, date, author)
         VALUES (%(link)s, %(title)s, %(full_text)s, %(preview)s, %(date)s, %(author)s)
+        ON DUPLICATE KEY UPDATE
+            title = VALUES(title),
+            full_text = VALUES(full_text),
+            preview = VALUES(preview),
+            date = VALUES(date),
+            author = VALUES(author)
         """
         with self.get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(sql, row)
-            affected = cursor.rowcount
+            affected = cursor.rowcount   # 1 – вставка, 2 – обновление
             conn.commit()
             return affected > 0
 
@@ -197,6 +215,10 @@ def collect_links(page, max_scrolls: int) -> Dict[str, tuple[str, str]]:
 
 # ---------- MAIN ----------
 def main() -> int:
+    # Простое решение для ошибки с временной папкой
+    import os
+    os.environ['PLAYWRIGHT_TMPDIR'] = '/tmp'
+
     db = DB(args.table_name)
     db.ensure_table()
     log(f"Целевая таблица: {args.database}.{args.table_name}")
@@ -206,13 +228,20 @@ def main() -> int:
         from playwright.sync_api import sync_playwright
     except ImportError:
         raise SystemExit("Установите playwright: pip install playwright && playwright install chromium")
-
+    
     processed_total = 0
     seen_total = 0
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
+        # Создаем постоянный контекст с пользовательской директорией
+        user_data_dir = os.path.join(PLAYWRIGHT_TEMP_DIR, "profile")
+        context = p.chromium.launch_persistent_context(
+            user_data_dir,
+            headless=True,
+            args=[
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+            ],
             user_agent=SETTINGS["user_agent"],
             locale=SETTINGS["locale"],
             timezone_id="UTC",
@@ -264,7 +293,7 @@ def main() -> int:
                 except:
                     pass
 
-        browser.close()
+        context.close()
 
     # Итоговая статистика
     with db.get_db_connection() as conn:
