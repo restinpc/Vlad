@@ -228,7 +228,7 @@ def main() -> int:
         from playwright.sync_api import sync_playwright
     except ImportError:
         raise SystemExit("Установите playwright: pip install playwright && playwright install chromium")
-    
+
     processed_total = 0
     seen_total = 0
 
