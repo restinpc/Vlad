@@ -352,13 +352,7 @@ def main() -> int:
     processed_total = 0
     seen_total = 0
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            env={  # Указываем другую временную директорию
-                'PLAYWRIGHT_BROWSERS_PATH': '/tmp/playwright_browsers',
-                'PLAYWRIGHT_TMP_DIR': '/tmp/playwright_temp'
-            }
-        )
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
