@@ -6,7 +6,7 @@ import argparse
 import datetime
 import traceback
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from curl_cffi import requests as crequests
 import requests
 from dotenv import load_dotenv
@@ -25,6 +25,7 @@ ALERT_EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 # ----------------------------------------------------------------------
 LIST_URL = "https://news-mediator.tradingview.com/news-flow/v2/news"
 STORY_URL = "https://news-mediator.tradingview.com/public/news/v1/story"
+
 
 # ----------------------------------------------------------------------
 # Функция отправки трейса об ошибке
@@ -178,13 +179,80 @@ def get_news():
 
 
 # ----------------------------------------------------------------------
-# Сохранение данных в MySQL через SQLAlchemy
+# Функция для создания таблицы с автоинкрементным ID, если она не существует
+# ----------------------------------------------------------------------
+def ensure_table_exists(table_name):
+    # Проверяем существование таблицы
+    with engine.connect() as conn:
+        result = conn.execute(text(f"""
+            SELECT COUNT(*) FROM information_schema.tables 
+            WHERE table_schema = '{args.database}' AND table_name = '{table_name}'
+        """))
+        table_exists = result.scalar() > 0
+
+    if not table_exists:
+        # Создаем новую таблицу с уникальным индексом на VARCHAR поле
+        create_query = text(f"""
+        CREATE TABLE {table_name} (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            datetime DATETIME,
+            title TEXT,
+            source VARCHAR(255),
+            description TEXT,
+            link VARCHAR(500),  -- Используем VARCHAR вместо TEXT для индекса
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY unique_link (link)  -- Теперь работает, т.к. link VARCHAR
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        """)
+        with engine.connect() as conn:
+            conn.execute(create_query)
+            conn.commit()
+        print(f"✅ Таблица '{table_name}' создана")
+    else:
+        # Проверяем наличие уникального индекса
+        with engine.connect() as conn:
+            result = conn.execute(text(f"""
+                SELECT COUNT(*) FROM information_schema.statistics 
+                WHERE table_schema = '{args.database}' 
+                AND table_name = '{table_name}' 
+                AND column_name = 'link' 
+                AND non_unique = 0
+            """))
+            has_unique = result.scalar() > 0
+
+        if not has_unique:
+            print(f"⚠️ Внимание: в таблице '{table_name}' нет уникального индекса на поле link")
+            print("Рекомендуется добавить уникальный индекс командой:")
+            print(f"ALTER TABLE {table_name} MODIFY link VARCHAR(500), ADD UNIQUE INDEX unique_link (link);")
+
+
+# ----------------------------------------------------------------------
+# Сохранение данных в MySQL через SQLAlchemy (только новая версия)
 # ----------------------------------------------------------------------
 def save_data(df, table_name):
     if df.empty:
         return
+
+    ensure_table_exists(table_name)
+
+    # Получаем существующие ссылки
     try:
-        df.to_sql(
+        with engine.connect() as conn:
+            existing = pd.read_sql(f"SELECT link FROM {table_name}", conn)
+            existing_links = set(existing['link'].tolist()) if not existing.empty else set()
+    except Exception as e:
+        print(f"⚠️ Ошибка при получении существующих ссылок: {e}")
+        existing_links = set()
+
+    # Фильтруем новые
+    df_new = df[~df['link'].isin(existing_links)]
+
+    if df_new.empty:
+        print("ℹ️ Нет новых новостей для добавления")
+        return
+
+    try:
+        df_new.to_sql(
             name=table_name,
             con=engine,
             if_exists='append',
@@ -192,7 +260,14 @@ def save_data(df, table_name):
             chunksize=1000,
             method='multi'
         )
-        print(f"✅ Добавлено {len(df)} строк в '{table_name}'")
+        print(f"✅ Добавлено {len(df_new)} новых строк из {len(df)} полученных")
+
+        # Показываем последние добавленные ID
+        with engine.connect() as conn:
+            result = conn.execute(text(f"SELECT MAX(id) FROM {table_name}"))
+            max_id = result.scalar()
+            print(f"📊 Последний ID в таблице: {max_id}")
+
     except Exception as e:
         print(f"❌ Ошибка записи: {e}")
         sys.exit(1)
