@@ -4,55 +4,105 @@ import os
 import sys
 import argparse
 import time
-from datetime import datetime
+import zipfile
+import io
+import traceback
+import re
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+import feedparser
+from dateutil import parser as date_parser
 import mysql.connector
 from mysql.connector import Error
-import traceback
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# === Конфигурация трассировки ошибок ===
 TRACE_URL = "https://server.brain-project.online/trace.php"
-NODE_NAME = os.getenv("NODE_NAME", "ecb_parser_loader")
+NODE_NAME = os.getenv("NODE_NAME", "ecb_parser")
 EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
+BASE_URL_RSS = "https://www.ecb.europa.eu/home/html/rss.en.html"
+ZIP_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip"
+CSV_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.csv"
 
-def send_error_trace(exc: Exception, script_name: str = "ecb_parser.py"):
-    logs = (
-        f"Node: {NODE_NAME}\n"
-        f"Script: {script_name}\n"
-        f"Exception: {repr(exc)}\n\n"
-        f"Traceback:\n{traceback.format_exc()}"
-    )
-    payload = {
-        "url": "cli_script",
-        "node": NODE_NAME,
-        "email": EMAIL,
-        "logs": logs,
-    }
-    print(f"\n📤 [POST] Отправляем отчёт об ошибке на {TRACE_URL}")
+
+def send_error_trace(exc: Exception):
+    logs = f"Node: {NODE_NAME}\nScript: ECB_parser.py\nException: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
     try:
-        import requests
-        response = requests.post(TRACE_URL, data=payload, timeout=10)
-        print(f"✅ [POST] Успешно отправлено! Статус: {response.status_code}")
+        requests.post(TRACE_URL, data={"url": "cli_script", "node": NODE_NAME, "email": EMAIL, "logs": logs},
+                      timeout=10)
+    except:
+        pass
+
+
+def download_and_read_zip_csv(url):
+    """
+    Скачивает ZIP-архив по URL, извлекает из него CSV-файл
+    и возвращает DataFrame.
+    """
+    local_zip = "eurofxref-hist.zip"
+    csv_filename_in_zip = "eurofxref-hist.csv"  # Предполагаемое имя файла внутри архива
+
+    try:
+        # 1. Скачиваем ZIP-архив
+        print(f"1. Скачиваю архив из: {url}")
+        response = requests.get(url, timeout=15, stream=True)
+        response.raise_for_status()
+
+        # Сохраняем ZIP на диск (чтобы иметь локальную копию)
+        with open(local_zip, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print(f"   Архив сохранён как: {local_zip}")
+
+        # 2. Распаковываем ZIP и читаем CSV
+        print(f"2. Извлекаю '{csv_filename_in_zip}' из архива...")
+        with zipfile.ZipFile(local_zip, 'r') as zf:
+            # Проверяем, есть ли нужный файл в архиве
+            if csv_filename_in_zip not in zf.namelist():
+                # Если имя другое, берём первый CSV файл
+                csv_files = [f for f in zf.namelist() if f.endswith('.csv')]
+                if not csv_files:
+                    raise Exception("В архиве не найдено CSV файлов.")
+                csv_filename_in_zip = csv_files[0]
+                print(f"   Найден CSV файл: {csv_filename_in_zip}")
+
+            # Читаем CSV сразу в pandas из архива (без распаковки всех файлов)
+            with zf.open(csv_filename_in_zip) as csv_file:
+                df = pd.read_csv(csv_file)
+
+        # 3. Выводим информацию
+        num_rows = df.shape[0]
+        print(f"   ✅ CSV загружен, строк: {num_rows}")
+        print(f"   Последняя дата: {df['Date'].max()}")
+
+        if df['Date'].max() < '2026-01-01':
+            raise ValueError(f"Данные старые! Max дата {df['Date'].max()}")
+
+        return df
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Ошибка при скачивании: {e}")
+        raise
+    except zipfile.BadZipFile:
+        print("❌ Ошибка: скачанный файл не является ZIP архивом или повреждён.")
+        raise
     except Exception as e:
-        print(f"⚠️ [POST] Не удалось отправить отчёт: {e}")
+        print(f"❌ Произошла ошибка: {e}")
+        raise
 
 
-# === Аргументы командной строки + .env fallback ===
-parser = argparse.ArgumentParser(description="ECB RSS Feeds Parser → MySQL (no local files)")
-parser.add_argument("table_name", help="Имя целевой таблицы в БД")
-parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"), help="Хост базы данных")
-parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"), help="Порт базы данных")
-parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"), help="Пользователь БД")
-parser.add_argument("password", nargs="?", default=os.getenv("DB_PASSWORD"), help="Пароль БД")
-parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"), help="Имя базы данных")
+parser = argparse.ArgumentParser(description="ECB Parser: rates из ZIP/CSV + items с полным текстом")
+parser.add_argument("table_name", help="Префикс таблиц (vlad, vlad_ecb_rates, vlad_ecb_items и т.д.)")
+parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"))
+parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"))
+parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"))
+parser.add_argument("password", nargs="?", default=os.getenv("DB_PASSWORD"))
+parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
-
-if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны все параметры подключения к БД (через аргументы или .env)")
-    sys.exit(1)
 
 DB_CONFIG = {
     'host': args.host,
@@ -62,119 +112,277 @@ DB_CONFIG = {
     'database': args.database,
 }
 
-BASE_URL = "https://www.ecb.europa.eu/home/html/rss.en.html"
 
+class ECBParser:
+    def __init__(self, prefix: str):
+        clean = prefix.split('_ecb_')[0].rstrip('_') if '_ecb_' in prefix else prefix
+        self.prefix = clean or "vlad"
 
-class ECBCollector:
-    def __init__(self, table_name: str):
-        self.table_name = table_name
+        p = prefix.lower()
+        if any(w in p for w in ['rates', 'exchange', 'fxref', 'currency']):
+            self.mode = "rates"
+        elif 'items' in p:
+            self.mode = "items"
+        else:
+            self.mode = "all"
+
+        self.items_table = f"{self.prefix}_ecb_items" if self.mode in ("all", "items") else None
+        self.rates_table = f"{self.prefix}_ecb_exchange_rates" if self.mode in ("all", "rates") else None
+
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
         self.init_db()
 
     def get_db_connection(self):
         return mysql.connector.connect(**DB_CONFIG)
 
     def init_db(self):
-        try:
-            with self.get_db_connection() as conn:
-                cursor = conn.cursor()
+        with self.get_db_connection() as conn:
+            cursor = conn.cursor()
+            if self.rates_table:
                 cursor.execute(f"""
-                    CREATE TABLE IF NOT EXISTS `{self.table_name}` (
+                    CREATE TABLE IF NOT EXISTS `{self.rates_table}` (
                         id INT AUTO_INCREMENT PRIMARY KEY,
-                        feed_url VARCHAR(255) NOT NULL,
-                        feed_title VARCHAR(255),
-                        saved_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                        xml_content LONGTEXT,
-                        UNIQUE KEY unique_feed_url (feed_url)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                        currency CHAR(3) NOT NULL,
+                        rate_date DATE NOT NULL,
+                        rate DECIMAL(22,12) NOT NULL,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY unique_rate (currency, rate_date)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
                 """)
-                conn.commit()
-                print(f"✅ Таблица `{self.table_name}` готова.")
-        except Error as err:
-            print(f"❌ Ошибка БД при инициализации: {err}")
+                print(f"   → Таблица {self.rates_table} ")
 
-    def fetch_and_parse_feeds(self):
-        from playwright.sync_api import sync_playwright
-        print(f"Поиск RSS лент на {BASE_URL}...")
-        feeds = []
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                locale="en-US",
-                timezone_id="UTC"
-            )
-            page = context.new_page()
-            page.goto(BASE_URL, timeout=30000)
-            page.wait_for_timeout(1000)
-            links = page.query_selector_all("a[href]")
-            for link in links:
-                href = link.get_attribute("href")
-                title = link.text_content().strip() or "ECB Feed"
-                if not href:
-                    continue
-                if "/rss/" in href or href.endswith(".xml") or href.endswith(".rss"):
-                    if "fxref" in href:
-                        continue
-                    from urllib.parse import urljoin
-                    full_url = urljoin("https://www.ecb.europa.eu", href)
-                    feeds.append((full_url, title))
-            browser.close()
-        unique_feeds = list(set(feeds))
-        print(f"Найдено {len(unique_feeds)} лент.")
-        return unique_feeds
+            if self.items_table:
+                cursor.execute(f"""
+                    CREATE TABLE IF NOT EXISTS `{self.items_table}` (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        feed_url VARCHAR(512) NOT NULL,
+                        guid VARCHAR(512) NOT NULL UNIQUE,
+                        feed_type VARCHAR(50),
+                        title VARCHAR(1024),
+                        link VARCHAR(1024),
+                        published_at DATETIME,
+                        description LONGTEXT,
+                        full_text LONGTEXT,
+                        scraped_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                """)
+                print(f"   → Таблица {self.items_table} (с автоинкрементом id)")
 
-    def download_feeds(self):
-        feeds = self.fetch_and_parse_feeds()
-        if not feeds:
-            print("Ленты не найдены.")
-            return
-        new_count = 0
+            conn.commit()
+            print(f"✅ Таблицы готовы (режим {self.mode})")
+
+    def run_rates(self):
+        print("\n📊 Скачиваем полную историю курсов из eurofxref-hist.zip...")
         try:
+            # Используем функцию для скачивания и чтения ZIP
+            df = download_and_read_zip_csv(ZIP_URL)
+
+            # Преобразуем DataFrame в длинный формат для БД
+            print("\n3. Преобразую данные для загрузки в БД...")
+            df_melted = df.melt(id_vars=['Date'], var_name='currency', value_name='rate')
+            df_melted['rate_date'] = pd.to_datetime(df_melted['Date'])
+            df_melted = df_melted.drop('Date', axis=1)
+
+            # Убираем строки с пустыми значениями
+            df_melted = df_melted.dropna(subset=['rate'])
+
+            print(f"   Всего записей для загрузки: {len(df_melted):,}")
+            print(f"   Диапазон дат: {df_melted['rate_date'].min()} → {df_melted['rate_date'].max()}")
+            print(f"   Уникальных валют: {df_melted['currency'].nunique()}")
+
+            # Загружаем в БД батчами
+            print("\n4. Загружаю данные в БД...")
+            batch_size = 10000
+            total_inserted = 0
+            total_updated = 0
+
             with self.get_db_connection() as conn:
                 cursor = conn.cursor()
-                for url, title in feeds:
-                    try:
-                        import requests
-                        resp = requests.get(url, timeout=30)
-                        if resp.status_code != 200:
+
+                for i in range(0, len(df_melted), batch_size):
+                    batch = df_melted.iloc[i:i + batch_size]
+
+                    # Подготавливаем данные для вставки
+                    values = [
+                        (row['currency'], row['rate_date'].strftime('%Y-%m-%d'), float(row['rate']))
+                        for _, row in batch.iterrows()
+                    ]
+
+                    # Вставка с обновлением при дубликате
+                    cursor.executemany(f"""
+                        INSERT INTO `{self.rates_table}` (currency, rate_date, rate)
+                        VALUES (%s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            rate = VALUES(rate),
+                            updated_at = CURRENT_TIMESTAMP
+                    """, values)
+
+                    conn.commit()
+                    batch_inserted = cursor.rowcount
+                    total_inserted += len(batch)
+                    print(f"      Загружено {total_inserted:,} / {len(df_melted):,} записей...")
+
+            print(f"\n✅ Успешно загружено {total_inserted:,} записей в {self.rates_table}")
+
+        except Exception as e:
+            print(f"❌ Ошибка в run_rates: {e}")
+            traceback.print_exc()
+            raise
+
+    def fetch_rss_feeds(self):
+        print(f"\n📡 Сканируем RSS-страницу → {BASE_URL_RSS}")
+        resp = self.session.get(BASE_URL_RSS, timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        feeds = []
+
+        # Игнорируем языковые страницы и не-RSS ссылки
+        language_titles = {
+            "Български", "Čeština", "Dansk", "Deutsch", "Eλληνικά", "English", "Español",
+            "Eesti keel", "Suomi", "Français", "Gaeilge", "Hrvatski", "Magyar", "Italiano",
+            "Lietuvių", "Latviešu", "Malti", "Nederlands", "Polski", "Português", "Română",
+            "Slovenčina", "Slovenščina", "Svenska"
+        }
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            title = a.get_text(strip=True) or "ECB Feed"
+
+            # Жёсткий фильтр: только настоящие RSS
+            if not (
+                href.startswith("/rss/fxref-") or          # валюты
+                "/rss/" in href and href.endswith((".html", ".rss", ".xml")) or
+                href.endswith((".rss", ".xml"))
+            ):
+                continue
+
+            # Пропускаем языковые и мусор
+            if re.match(r'^/rss\.[a-z]{2,3}\.html?$', href) or title in language_titles:
+                continue
+
+            if any(x in href.lower() for x in ["hist", "90d", "archive", ".zip", "pdf"]):
+                continue
+
+            full_url = urljoin("https://www.ecb.europa.eu", href)
+
+            # Дополнительно: проверяем, что это действительно RSS (опционально, но полезно)
+            # Можно добавить HEAD-запрос, но для скорости оставим так
+            feeds.append((full_url, title))
+
+        feeds = list(dict.fromkeys(feeds))
+        print(f" Найдено {len(feeds)} реальных RSS-фидов")
+        for url, t in feeds[:10]:  # покажем первые 10 для отладки
+            print(f"   - {t}: {url}")
+        return feeds
+
+    def run_items(self):
+        print("\n📰 Собираем RSS-статьи...")
+        feeds = self.fetch_rss_feeds()
+        count_new = 0
+
+        for feed_url, title in feeds:
+            print(f"\n   ↓ Обрабатываем фид: {title}")
+            try:
+                r = self.session.get(feed_url, timeout=45)
+                r.raise_for_status()
+                d = feedparser.parse(r.text)
+
+                feed_type = self._get_feed_type(feed_url)
+
+                with self.get_db_connection() as conn:
+                    cursor = conn.cursor()
+
+                    for entry in d.entries:
+                        try:
+                            guid = entry.get('id') or entry.get('guid') or entry.get('link')
+                            if not guid: continue
+
+                            published = None
+                            for f in ['published', 'updated', 'dc_date', 'pubDate']:
+                                if entry.get(f):
+                                    try:
+                                        published = date_parser.parse(entry.get(f))
+                                        break
+                                    except:
+                                        continue
+
+                            desc = entry.get('summary') or entry.get('description') or ""
+                            if isinstance(desc, dict) and 'value' in desc:
+                                desc = desc['value']
+
+                            link = entry.get('link')
+                            full_text = None
+
+                            if link:
+                                try:
+                                    html_r = self.session.get(link, timeout=30)
+                                    html_r.raise_for_status()
+                                    soup = BeautifulSoup(html_r.text, 'html.parser')
+
+                                    for tag in soup(['header', 'footer', 'nav', 'aside', 'script', 'style', 'form']):
+                                        tag.decompose()
+
+                                    content = soup.find('main') or soup.find('article') or \
+                                              soup.find('div', class_=['content', 'article', 'rte', 'ecb-article'])
+                                    if content:
+                                        full_text = content.get_text(separator='\n', strip=True)
+                                    else:
+                                        full_text = soup.get_text(separator='\n', strip=True)[:200000]
+
+                                except Exception as e:
+                                    print(f"        Не удалось спарсить статью {link}: {e}")
+
+                            cursor.execute(f"""
+                                INSERT INTO `{self.items_table}` 
+                                (feed_url, guid, feed_type, title, link, published_at, description, full_text)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                ON DUPLICATE KEY UPDATE 
+                                    title=VALUES(title),
+                                    published_at=VALUES(published_at),
+                                    description=VALUES(description),
+                                    full_text=VALUES(full_text),
+                                    scraped_at=NOW()
+                            """, (
+                            feed_url, guid, feed_type, entry.get('title'), link, published, desc[:50000], full_text))
+
+                            if cursor.rowcount != 0:
+                                count_new += 1
+
+                        except Exception as e:
                             continue
-                        content = resp.text
-                        cursor.execute(f"""
-                            INSERT INTO `{self.table_name}` (feed_url, feed_title, xml_content)
-                            VALUES (%s, %s, %s)
-                            ON DUPLICATE KEY UPDATE
-                                xml_content = VALUES(xml_content),
-                                saved_at = NOW()
-                        """, (url, title, content))
-                        if cursor.rowcount > 0:
-                            new_count += 1
-                            print(f"Обновлено: {title}")
-                    except Exception as e:
-                        print(f"Ошибка при обработке {url}: {e}")
-                conn.commit()
-                print(f"Цикл завершен. Обновлено записей: {new_count}")
-        except Error as err:
-            print(f"Ошибка БД: {err}")
 
+                    conn.commit()
+                    print(f"      ✅ Обработано {len(d.entries)} записей")
 
-def main():
-    print(f"Запуск ECB Collector (MySQL Mode, без файлов)")
-    print(f"База: {args.host}:{args.port}/{args.database}")
-    print("=" * 40)
+            except Exception as e:
+                print(f"      ❌ Ошибка: {e}")
+            time.sleep(1.5)
 
-    collector = ECBCollector(args.table_name)
-    collector.download_feeds()
-    print("\n🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+        print(f"\n✅ Добавлено/обновлено {count_new} статей в {self.items_table}")
+
+    def _get_feed_type(self, url: str) -> str:
+        u = url.lower()
+        if 'fxref' in u: return 'exchange_rate'
+        if any(x in u for x in ['press', 'pressreleases']): return 'press_release'
+        if 'speech' in u or '/key/' in u: return 'speech'
+        if 'blog' in u: return 'blog'
+        if 'statpress' in u: return 'statistical_release'
+        return 'other'
+
+    def run(self):
+        print(f"\n🚀 ECB Parser запущен | префикс: {self.prefix} | режим: {self.mode.upper()}")
+        if self.mode in ("all", "rates"):
+            self.run_rates()
+        if self.mode in ("all", "items"):
+            self.run_items()
+        print("\n🏁 Завершено!")
 
 
 if __name__ == "__main__":
     try:
-        main()
-    except SystemExit:
-        pass
-    except KeyboardInterrupt:
-        print("\n🛑 Прервано пользователем")
+        ECBParser(args.table_name).run()
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"❌ Критическая ошибка: {e}")
         send_error_trace(e)
         sys.exit(1)
