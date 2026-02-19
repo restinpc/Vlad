@@ -11,7 +11,23 @@ from sqlalchemy import create_engine, text
 import requests
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
+import os
+import tempfile
 
+# Создаём папку для временных файлов Playwright в домашней директории
+TEMP_DIR = os.path.join(os.path.expanduser("~"), ".playwright-tmp")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Перенаправляем все переменные окружения, влияющие на временные файлы
+os.environ["PLAYWRIGHT_TMPDIR"] = TEMP_DIR
+os.environ["TMPDIR"] = TEMP_DIR
+os.environ["TEMP"] = TEMP_DIR
+os.environ["TMP"] = TEMP_DIR
+
+# Также говорим модулю tempfile использовать эту папку
+tempfile.tempdir = TEMP_DIR
+
+print(f"Временная директория Playwright: {TEMP_DIR}")
 load_dotenv()
 
 # ----------------------------------------------------------------------
@@ -455,4 +471,3 @@ if __name__ == "__main__":
         print(f"\n❌ Критическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)
-        # добавить первые 5 штук старые перестанет работать
