@@ -1,4 +1,4 @@
-import uvicorn
+﻿import uvicorn
 import os
 import asyncio
 import traceback
