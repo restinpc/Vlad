@@ -240,89 +240,134 @@ async def preload_all_data():
 
     print("🔄 ECB FULL DATA RELOAD STARTED")
 
-    # Очистка глобальных переменных
+    # Очистка всех глобальных переменных
     GLOBAL_WEIGHT_CODES.clear()
     GLOBAL_CTX_INDEX.clear()
     GLOBAL_ECB_BY_CCY.clear()
     GLOBAL_ECB_CONTEXT.clear()
     GLOBAL_ECB_OBS_DATES.clear()
     GLOBAL_ECB_CTX_HIST.clear()
+    GLOBAL_RATES.clear()
+    GLOBAL_EXTREMUMS.clear()
+    GLOBAL_CANDLE_RANGES.clear()
+    GLOBAL_AVG_RANGE.clear()
+    GLOBAL_LAST_CANDLES.clear()
 
-
+    # ── 1. Загрузка из vlad БД (веса, контексты, курсы ECB) ─────────────
     async with engine_vlad.connect() as conn:
-        # ДИАГНОСТИКА 1: Проверим подключение
-        print("📡 Проверка подключения к vlad БД...")
+        # 1.1 Веса (weight_code)
+        try:
+            res = await conn.execute(
+                text("SELECT weight_code FROM vlad_ecb_rate_weights")
+            )
+            rows = res.mappings().all()
+            GLOBAL_WEIGHT_CODES = [r["weight_code"] for r in rows]
+            print(f"  weight_codes загружено: {len(GLOBAL_WEIGHT_CODES)}")
+            if GLOBAL_WEIGHT_CODES:
+                print(f"  Примеры: {GLOBAL_WEIGHT_CODES[:5]}")
+        except Exception as e:
+            print(f"❌ Ошибка загрузки weight_codes: {e}")
 
-        # ДИАГНОСТИКА 2: Список таблиц
-        res = await conn.execute(text("SHOW TABLES"))
-        all_tables = [r[0] for r in res.fetchall()]
-        print(f"📋 Все таблицы в БД ({len(all_tables)}):")
-        for t in all_tables[:10]:  # покажем первые 10
-            print(f"   - {t}")
+        # 1.2 Контекстный индекс
+        try:
+            res = await conn.execute(text("""
+                SELECT currency, rate_change_dir, trend_dir,
+                       momentum_dir, occurrence_count
+                FROM vlad_ecb_rate_context_idx
+            """))
+            for r in res.mappings().all():
+                key = (r["currency"], r["rate_change_dir"],
+                       r["trend_dir"], r["momentum_dir"])
+                GLOBAL_CTX_INDEX[key] = {
+                    "occurrence_count": r["occurrence_count"] or 0
+                }
+            print(f"  ctx_index загружено: {len(GLOBAL_CTX_INDEX)} контекстов")
+        except Exception as e:
+            print(f"❌ Ошибка загрузки ctx_index: {e}")
 
-        # ДИАГНОСТИКА 3: Ищем таблицы с weight
-        weight_tables = [t for t in all_tables if 'weight' in t.lower()]
-        print(f"📋 Таблицы с 'weight': {weight_tables}")
+        # 1.3 ECB-курсы и вычисление контекста для каждой даты
+        try:
+            res = await conn.execute(text("""
+                SELECT currency, rate_date, rate
+                FROM vlad_ecb_exchange_rates
+                ORDER BY currency, rate_date
+            """))
+            by_ccy = defaultdict(list)
+            for r in res.mappings().all():
+                by_ccy[r["currency"]].append(
+                    (r["rate_date"], float(r["rate"]))
+                )
 
-        # ДИАГНОСТИКА 4: Проверяем конкретную таблицу
-        table_name = 'vlad_ecb_rate_weights'
-        if table_name in all_tables:
-            print(f"✅ Таблица {table_name} существует")
+            for ccy, rates in by_ccy.items():
+                GLOBAL_ECB_BY_CCY[ccy] = rates
+                for dt, rcd, td, md in classify_observations(rates):
+                    GLOBAL_ECB_CONTEXT[(ccy, dt)] = (rcd, td, md)
+                    GLOBAL_ECB_OBS_DATES[dt].add(ccy)
+                    ctx_key = (ccy, rcd, td, md)
+                    GLOBAL_ECB_CTX_HIST.setdefault(ctx_key, []).append(dt)
 
-            # Структура
-            res = await conn.execute(text(f"DESCRIBE {table_name}"))
-            columns = [r[0] for r in res.fetchall()]
-            print(f"📊 Колонки: {columns}")
+            for key in GLOBAL_ECB_CTX_HIST:
+                GLOBAL_ECB_CTX_HIST[key].sort()
 
-            # Количество записей
-            res = await conn.execute(text(f"SELECT COUNT(*) FROM {table_name}"))
-            count = res.scalar()
-            print(f"📊 Записей: {count}")
+            print(f"  ECB currencies: {len(by_ccy)}, наблюдений: {len(GLOBAL_ECB_CONTEXT)}")
+        except Exception as e:
+            print(f"❌ Ошибка загрузки ECB-курсов: {e}")
 
-            if count > 0:
-                # Пробуем прочитать данные
-                if 'weight_code' in columns:
-                    res = await conn.execute(text(f"SELECT weight_code FROM {table_name}"))
-                    GLOBAL_WEIGHT_CODES = [r[0] for r in res.fetchall()]
-                    print(f"✅ Загружено {len(GLOBAL_WEIGHT_CODES)} weight_code")
-                    print(f"📝 Примеры: {GLOBAL_WEIGHT_CODES[:5]}")
-                else:
-                    # Если нет weight_code, берем первую колонку
-                    first_col = columns[0]
-                    print(f"⚠️ Нет колонки 'weight_code', использую '{first_col}'")
-                    res = await conn.execute(text(f"SELECT {first_col} FROM {table_name}"))
-                    GLOBAL_WEIGHT_CODES = [str(r[0]) for r in res.fetchall()]
-                    print(f"✅ Загружено {len(GLOBAL_WEIGHT_CODES)} значений из {first_col}")
-            else:
-                print("❌ Таблица пуста!")
+    # ── 2. Загрузка из brain БД (котировки, экстремумы) ─────────────────
+    tables = [
+        "brain_rates_eur_usd", "brain_rates_eur_usd_day",
+        "brain_rates_btc_usd", "brain_rates_btc_usd_day",
+        "brain_rates_eth_usd", "brain_rates_eth_usd_day",
+    ]
+    for table in tables:
+        try:
+            GLOBAL_RATES[table] = {}
+            GLOBAL_LAST_CANDLES[table] = []
+            GLOBAL_CANDLE_RANGES[table] = {}
+            GLOBAL_AVG_RANGE[table] = 0.0
+            GLOBAL_EXTREMUMS[table] = {"min": set(), "max": set()}
 
-                # Проверим, есть ли данные в других таблицах
-                for wt in weight_tables:
-                    if wt != table_name:
-                        res = await conn.execute(text(f"SELECT COUNT(*) FROM {wt}"))
-                        cnt = res.scalar()
-                        print(f"   {wt}: {cnt} записей")
-        else:
-            print(f"❌ Таблица {table_name} НЕ существует!")
-            print(f"   Возможные варианты: {weight_tables}")
+            async with engine_brain.connect() as conn:
+                res = await conn.execute(text(
+                    f"SELECT date, open, close, `max`, `min`, t1 FROM {table}"
+                ))
+                rows = sorted(res.mappings().all(), key=lambda x: x["date"])
+                ranges = []
+                for r in rows:
+                    dt = r["date"]
+                    if r["t1"] is not None:
+                        GLOBAL_RATES[table][dt] = float(r["t1"])
+                    is_bull = r["close"] > r["open"]
+                    GLOBAL_LAST_CANDLES[table].append((dt, is_bull))
+                    rng = float(r["max"] or 0) - float(r["min"] or 0)
+                    GLOBAL_CANDLE_RANGES[table][dt] = rng
+                    ranges.append(rng)
 
-            # Если есть похожая таблица, используем её
-            if weight_tables:
-                alternative = weight_tables[0]
-                print(f"⚠️ Использую альтернативную таблицу: {alternative}")
+                GLOBAL_AVG_RANGE[table] = (
+                    sum(ranges) / len(ranges) if ranges else 0.0
+                )
 
-                res = await conn.execute(text(f"DESCRIBE {alternative}"))
-                columns = [r[0] for r in res.fetchall()]
-                print(f"📊 Колонки {alternative}: {columns}")
+                # Экстремумы (локальные минимумы/максимумы)
+                for typ in ("min", "max"):
+                    op = ">" if typ == "max" else "<"
+                    col = typ
+                    q = f"""
+                        SELECT t1.date FROM {table} t1
+                        JOIN {table} t_prev ON t_prev.date = t1.date - INTERVAL 1 DAY
+                        JOIN {table} t_next ON t_next.date = t1.date + INTERVAL 1 DAY
+                        WHERE t1.{col} {op} t_prev.{col}
+                          AND t1.{col} {op} t_next.{col}
+                    """
+                    res_ext = await conn.execute(text(q))
+                    GLOBAL_EXTREMUMS[table][typ] = {
+                        r["date"] for r in res_ext.mappings().all()
+                    }
+            print(f"  {table}: {len(GLOBAL_RATES[table])} свечей")
+        except Exception as e:
+            print(f"❌ Ошибка загрузки {table}: {e}")
 
-                # Берем первую колонку
-                if columns:
-                    res = await conn.execute(text(f"SELECT {columns[0]} FROM {alternative}"))
-                    GLOBAL_WEIGHT_CODES = [str(r[0]) for r in res.fetchall()]
-                    print(f"✅ Загружено {len(GLOBAL_WEIGHT_CODES)} значений из {alternative}")
-
-    print(f"✅ ИТОГО: загружено {len(GLOBAL_WEIGHT_CODES)} weight codes")
     LAST_RELOAD_TIME = datetime.now()
+    print("✅ ECB FULL DATA RELOAD COMPLETED")
 
 
 async def background_reload_data():
