@@ -158,7 +158,7 @@ def run_tests(port: int, num_random_tests: int = 15):
 
 def main():
     parser = argparse.ArgumentParser(description="Тестирование brain-микросервисов")
-    parser.add_argument("--port", type=int, required=True, help="Порт сервиса (например, 8892 или 8893)")
+    parser.add_argument("--port", type=int, required=True, help="Порт сервиса (например, 8895 или 8893)")
     parser.add_argument("--num-random", type=int, default=5, help="Количество случайных тестов")
     args = parser.parse_args()
 
