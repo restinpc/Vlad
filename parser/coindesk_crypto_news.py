@@ -11,43 +11,53 @@ from sqlalchemy import create_engine, text
 import requests
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
-import os
 import tempfile
 
-# Создаём папку для временных файлов Playwright в домашней директории
+# ----------------------------------------------------------------------
+# Настройка временной директории для Playwright
+# ----------------------------------------------------------------------
 TEMP_DIR = os.path.join(os.path.expanduser("~"), ".playwright-tmp")
 os.makedirs(TEMP_DIR, exist_ok=True)
-# Перенаправляем все переменные окружения, влияющие на временные файлы
 os.environ["PLAYWRIGHT_TMPDIR"] = TEMP_DIR
 os.environ["TMPDIR"] = TEMP_DIR
 os.environ["TEMP"] = TEMP_DIR
 os.environ["TMP"] = TEMP_DIR
-# Также говорим модулю tempfile использовать эту папку
 tempfile.tempdir = TEMP_DIR
 print(f"Временная директория Playwright: {TEMP_DIR}")
 
 load_dotenv()
 
 # ----------------------------------------------------------------------
-# Конфигурация отправки ошибок (аналог trace.php)
+# Конфигурация отправки ошибок
 # ----------------------------------------------------------------------
 TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "vlad_coindesk_crypto_news")
 ALERT_EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
 # ----------------------------------------------------------------------
-# Параметры парсинга CoinDesk.com
+# Параметры парсинга
 # ----------------------------------------------------------------------
 BASE_URL = "https://www.coindesk.com/latest-crypto-news"
-MAX_CLICKS = 999  # Защита от бесконечного цикла (практически unlimited)
+MAX_CLICKS = 999  # лимит кликов "More Stories"
+
+# ----------------------------------------------------------------------
+# Селекторы для элементов на странице (можно легко обновить)
+# ----------------------------------------------------------------------
+SELECTORS = {
+    'news_container': 'div[class*="flex gap-4"]',  # контейнер новости (уточнить!)
+    'title_link': 'a[class*="content-card-title"]',  # ссылка с заголовком
+    'category': 'a[class*="font-title"]',  # категория
+    'description': 'p[class*="font-body"]',  # описание
+    'date': 'span[class*="font-metadata"]',  # дата
+    'more_button': 'button:has-text("More Stories")',  # кнопка "More Stories"
+    'cookie_accept': 'button:has-text("Accept"), button:has-text("I Accept"), button:has-text("Got It")'
+}
+
 
 # ----------------------------------------------------------------------
 # Функция отправки трейса об ошибке
 # ----------------------------------------------------------------------
 def send_error_trace(exc: Exception, script_name: str = "coindesk_crypto_news.py"):
-    """
-    Отправляет информацию об исключении на сервер трейсов.
-    """
     logs = (
         f"Node: {NODE_NAME}\n"
         f"Script: {script_name}\n"
@@ -63,8 +73,8 @@ def send_error_trace(exc: Exception, script_name: str = "coindesk_crypto_news.py
     try:
         requests.post(TRACE_URL, data=payload, timeout=10)
     except Exception:
-        # Если не удалось отправить трейс – игнорируем
         pass
+
 
 # ----------------------------------------------------------------------
 # Парсинг аргументов командной строки
@@ -95,18 +105,14 @@ SQLALCHEMY_URL = (
 )
 engine = create_engine(SQLALCHEMY_URL, pool_recycle=3600)
 
+
 # ----------------------------------------------------------------------
 # Асинхронный парсинг с бесконечным скроллом и загрузкой в БД
 # ----------------------------------------------------------------------
 async def parse_and_save_incrementally(table_name, max_clicks=None):
-    """
-    Парсит страницу, кликает на 'More Stories' и сохраняет в БД инкрементально.
-    Останавливается, когда кнопка исчезает или достигнут лимит кликов.
-    """
     print("[*] Запуск парсера CoinDesk.com (headless mode)...")
-    # Создаём таблицу если её нет
     ensure_table_exists(table_name)
-    # Получаем список существующих ссылок ОДИН РАЗ в начале
+
     print("[*] Загрузка существующих ссылок из БД...")
     try:
         with engine.connect() as conn:
@@ -118,9 +124,9 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
         existing_links = set()
 
     async with async_playwright() as p:
-        # Headless-режим с stealth настройками
+        # Запускаем браузер (headless=False для отладки, потом можно сменить на True)
         browser = await p.chromium.launch(
-            headless=True,
+            headless=True,  # при отладке видим окно, потом можно True
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage',
@@ -135,7 +141,7 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
             timezone_id='America/New_York',
         )
         page = await context.new_page()
-        # Скрываем webdriver
+        # Скрываем автоматизацию
         await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => undefined
@@ -151,13 +157,14 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
 
         try:
             print(f"\n📄 Загрузка главной страницы: {BASE_URL}")
-            await page.goto(BASE_URL, timeout=30000)
-            await page.wait_for_load_state('networkidle')
-            await asyncio.sleep(2)
+            # Ждём только загрузки DOM, не всех ресурсов (это быстро)
+            await page.goto(BASE_URL, wait_until='domcontentloaded', timeout=120000)
+            print(" ✓ DOM загружен. Ожидаем 30 секунд для подгрузки динамического контента...")
+            await asyncio.sleep(30)
 
             # Закрываем cookie-баннер если есть
             try:
-                accept_btn = page.locator('button:has-text("Accept"), button:has-text("I Accept"), button:has-text("Got It")')
+                accept_btn = page.locator(SELECTORS['cookie_accept'])
                 if await accept_btn.is_visible(timeout=3000):
                     await accept_btn.click()
                     print(" ✓ Cookie-баннер закрыт")
@@ -165,14 +172,17 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
             except:
                 pass
 
+            # Основной цикл подгрузки новостей
             while click_num < max_limit and consecutive_failures < MAX_CONSECUTIVE_FAILURES:
-                # Парсим текущие новости
-                news_items = await page.locator('div[class*="flex gap-4"]').all()  # Адаптированный селектор
+                # Парсим текущие новости (не дожидаясь специально)
+                news_items = await page.locator(SELECTORS['news_container']).all()
+                print(f"   Найдено элементов новостей: {len(news_items)}")
+
                 page_news = []
                 for idx, item in enumerate(news_items, 1):
                     try:
-                        # === ЗАГОЛОВОК И ССЫЛКА ===
-                        title_elem = item.locator('a[class*="content-card-title"]')
+                        # Заголовок и ссылка
+                        title_elem = item.locator(SELECTORS['title_link'])
                         title = await title_elem.inner_text(timeout=1000) if await title_elem.count() > 0 else None
                         href = await title_elem.get_attribute('href', timeout=1000) if title else None
 
@@ -184,20 +194,19 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
                         if not href.startswith('http'):
                             href = f"https://www.coindesk.com{href}"
 
-                        # === КАТЕГОРИЯ ===
-                        cat_elem = item.locator('a[class*="font-title"]')
+                        # Категория
+                        cat_elem = item.locator(SELECTORS['category'])
                         category = await cat_elem.inner_text(timeout=1000) if await cat_elem.count() > 0 else "News"
 
-                        # === ОПИСАНИЕ ===
-                        desc_elem = item.locator('p[class*="font-body"]')
+                        # Описание
+                        desc_elem = item.locator(SELECTORS['description'])
                         description = await desc_elem.inner_text(timeout=1000) if await desc_elem.count() > 0 else ""
 
-                        # === ДАТА ===
-                        date_elem = item.locator('span[class*="font-metadata"]')
+                        # Дата
+                        date_elem = item.locator(SELECTORS['date'])
                         published_at = await date_elem.inner_text(timeout=1000) if await date_elem.count() > 0 else ""
 
-                        # Конвертируем в datetime (если нужно)
-                        dt = datetime.datetime.now()  # По умолчанию
+                        dt = datetime.datetime.now()  # можно заменить на парсинг даты
 
                         page_news.append({
                             'datetime': dt,
@@ -212,10 +221,9 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
                         print(f" ⚠️ Ошибка парсинга элемента {idx}: {e}")
                         continue
 
-                # === СРАЗУ СОХРАНЯЕМ В БД ===
+                # Сохраняем новые записи в БД
                 if page_news:
                     df_page = pd.DataFrame(page_news)
-                    # Фильтруем новые
                     df_new = df_page[~df_page['link'].isin(existing_links)]
                     if not df_new.empty:
                         try:
@@ -239,26 +247,34 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
 
                 # Кликаем на "More Stories"
                 try:
-                    load_more_btn = page.locator('button:has-text("More Stories")')
+                    load_more_btn = page.locator(SELECTORS['more_button'])
+                    # Проверяем видимость кнопки
                     if not await load_more_btn.is_visible(timeout=5000):
                         print(" ℹ️ Кнопка 'More Stories' больше не видна. Остановка.")
                         break
                     await load_more_btn.click()
-                    await page.wait_for_load_state('networkidle')
-                    await asyncio.sleep(3)  # Дольше пауза для загрузки
+
+                    # Ждём фиксированное время для загрузки новых статей
+                    await asyncio.sleep(5)
+
                     click_num += 1
                     print(f" ✓ Клик на 'More Stories' {click_num}/{max_limit}")
                 except Exception as e:
                     consecutive_failures += 1
                     print(f" ⚠️ Ошибка клика (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}")
+                    # Делаем скриншот при ошибке клика
+                    await page.screenshot(path=f"error_click_{click_num}.png")
                     await asyncio.sleep(2)
                     continue
 
         except Exception as e:
             print(f" ❌ Критическая ошибка в цикле: {e}")
+            await page.screenshot(path="critical_error.png")
+            send_error_trace(e)
 
         await browser.close()
 
+        # Итоговая статистика
         print(f"\n{'=' * 60}")
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
             print(f"⚠️ Остановлено: {MAX_CONSECUTIVE_FAILURES} последовательных неудач")
@@ -269,7 +285,6 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
         print(f"📄 Обработано кликов: {click_num}")
         print(f"📊 Спарсено новостей: {total_parsed}")
         print(f"💾 Добавлено в БД: {total_added}")
-        # Показываем последний ID
         try:
             with engine.connect() as conn:
                 result = conn.execute(text(f"SELECT MAX(id) FROM {table_name}"))
@@ -279,13 +294,11 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
             pass
         return total_added
 
+
 # ----------------------------------------------------------------------
-# Функция для создания таблицы с автоинкрементным ID
+# Функция для создания таблицы
 # ----------------------------------------------------------------------
 def ensure_table_exists(table_name):
-    """
-    Проверяет существование таблицы и создаёт её при необходимости
-    """
     with engine.connect() as conn:
         result = conn.execute(text(f"""
             SELECT COUNT(*) FROM information_schema.tables
@@ -313,7 +326,6 @@ def ensure_table_exists(table_name):
             conn.commit()
         print(f"✅ Таблица '{table_name}' создана с автоинкрементом")
     else:
-        # Проверяем наличие уникального индекса
         with engine.connect() as conn:
             result = conn.execute(text(f"""
                 SELECT COUNT(*) FROM information_schema.statistics
@@ -328,6 +340,7 @@ def ensure_table_exists(table_name):
             print("Рекомендуется добавить уникальный индекс командой:")
             print(f"ALTER TABLE {table_name} MODIFY link VARCHAR(500), ADD UNIQUE INDEX unique_link (link);")
 
+
 # ----------------------------------------------------------------------
 # Основная логика
 # ----------------------------------------------------------------------
@@ -340,7 +353,6 @@ def main():
     else:
         print(f"📄 Лимит кликов: все доступные (макс. {MAX_CLICKS})")
     print("=" * 60)
-    # Запускаем парсинг с бесконечным скроллом
     total_added = asyncio.run(
         parse_and_save_incrementally(args.table_name, max_clicks=args.max_clicks)
     )
@@ -350,6 +362,7 @@ def main():
         print("ℹ️ Все новости уже были в БД")
     else:
         print(f"✨ Успешно добавлено {total_added} новых записей")
+
 
 if __name__ == "__main__":
     try:
