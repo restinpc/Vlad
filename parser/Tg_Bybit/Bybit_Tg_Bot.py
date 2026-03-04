@@ -115,7 +115,7 @@ async def collect_response(bot_id: int, query: str) -> str:
         client.remove_event_handler(handler, events.NewMessage)
 
 
-# ==================== РАБОТА С БАЗОЙ ДАННЫХ (в стиле первого скрипта) ====================
+# ==================== РАБОТА С БАЗОЙ ДАННЫХ  ====================
 
 def ensure_table_exists(engine, table_name, database_name):
     """
