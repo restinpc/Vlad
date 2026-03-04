@@ -628,7 +628,7 @@ async def patch_service():
 if __name__ == "__main__":
     try:
         uvicorn.run("server:app",
-                    host="0.0.0.0", port=8895,
+                    host="0.0.0.0", port=8896,
                     reload=False, workers=1)
     except KeyboardInterrupt:
         print("\n🛑 Сервер остановлен")
