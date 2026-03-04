@@ -1,4 +1,4 @@
-﻿import os
+import os
 import mysql.connector
 from dotenv import load_dotenv
 
@@ -52,8 +52,7 @@ IMPORTANCE_MAP_REV = {v: k for k, v in IMPORTANCE_MAP.items()}
 
 
 # ── DDL ───────────────────────────────────────────────────────────────────────
-# Изменён первичный ключ: теперь составной (event_id, weight_code),
-# так как weight_code больше не содержит event_id.
+
 DDL = f"""
 CREATE TABLE IF NOT EXISTS `{OUT_TABLE}` (
   `weight_code`       VARCHAR(64)   NOT NULL,
@@ -68,7 +67,7 @@ CREATE TABLE IF NOT EXISTS `{OUT_TABLE}` (
   `occurrence_count`  INT           NULL,
   `created_at`        TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
 
-  PRIMARY KEY (`event_id`, `weight_code`),
+  PRIMARY KEY (`weight_code`),
   KEY `idx_cw_event`    (`event_id`),
   KEY `idx_cw_currency` (`currency_code`),
   KEY `idx_cw_imp`      (`importance`),
@@ -105,50 +104,51 @@ def encode(value: str, direction_type: str) -> str:
     return maps.get(direction_type, {}).get(value, "X")
 
 
-def make_weight_code(currency: str, importance: str,
+def make_weight_code(event_id: int, currency: str, importance: str,
                      fcd: str, scd: str, rcd: str,
                      mode: int, hour_shift: int | None = None) -> str:
     """
-    Генерирует компактный weight_code без идентификатора события.
-    Формат: CURR_IMP_FCD_SCD_RCD_MODE[_SHIFT]
+    Генерирует компактный weight_code для события экономического календаря.
 
-    >>> make_weight_code('USD', 'high', 'BEAT', 'UP', 'NONE', 0)
-    'USD_H_B_U_N_0'
-    >>> make_weight_code('USD', 'high', 'BEAT', 'UP', 'NONE', 1, -6)
-    'USD_H_B_U_N_1_-6'
+    >>> make_weight_code(14, 'USD', 'high', 'BEAT', 'UP', 'NONE', 0)
+    'E14_USD_H_B_U_N_0'
+    >>> make_weight_code(14, 'USD', 'high', 'BEAT', 'UP', 'NONE', 1, -6)
+    'E14_USD_H_B_U_N_1_-6'
     """
     imp_c = encode(importance, "importance")
     fcd_c = encode(fcd, "forecast")
     scd_c = encode(scd, "surprise")
     rcd_c = encode(rcd, "revision")
-    base  = f"{currency}_{imp_c}_{fcd_c}_{scd_c}_{rcd_c}_{mode}"
+    base  = f"E{event_id}_{currency}_{imp_c}_{fcd_c}_{scd_c}_{rcd_c}_{mode}"
     return base if hour_shift is None else f"{base}_{hour_shift}"
 
 
 def decode_weight_code(code: str) -> dict:
     """
-    Обратная функция: weight_code → словарь полей (без event_id).
+    Обратная функция: weight_code → словарь полей.
 
-    >>> decode_weight_code('USD_H_B_U_N_0_-5')
-    {'currency_code': 'USD', 'importance': 'high',
+    >>> decode_weight_code('E14_USD_H_B_U_N_0_5')
+    {'event_id': 14, 'currency_code': 'USD', 'importance': 'high',
      'forecast_dir': 'BEAT', 'surprise_dir': 'UP', 'revision_dir': 'NONE',
-     'mode_val': 0, 'hour_shift': -5}
+     'mode_val': 0, 'hour_shift': 5}
     """
     parts = code.split("_")
-    # Минимум: {curr} _ {imp} _ {fcd} _ {scd} _ {rcd} _ {mode}
-    if len(parts) < 6:
+    # Минимум: E{id} _ {curr} _ {imp} _ {fcd} _ {scd} _ {rcd} _ {mode}
+    if len(parts) < 7:
         return {}
-    currency   = parts[0]
-    importance = IMPORTANCE_MAP_REV.get(parts[1], parts[1])
-    fcd        = FORECAST_MAP_REV.get(parts[2], parts[2])
-    scd        = SURPRISE_MAP_REV.get(parts[3], parts[3])
-    rcd        = REVISION_MAP_REV.get(parts[4], parts[4])
     try:
-        mode = int(parts[5])
+        event_id = int(parts[0][1:])          # убираем 'E'
     except ValueError:
         return {}
-    shift = int(parts[6]) if len(parts) > 6 else None
+    currency   = parts[1]
+    importance = IMPORTANCE_MAP_REV.get(parts[2], parts[2])
+    fcd        = FORECAST_MAP_REV.get(parts[3], parts[3])
+    scd        = SURPRISE_MAP_REV.get(parts[4], parts[4])
+    rcd        = REVISION_MAP_REV.get(parts[5], parts[5])
+    mode       = int(parts[6])
+    shift      = int(parts[7]) if len(parts) > 7 else None
     return {
+        "event_id":      event_id,
         "currency_code": currency,
         "importance":    importance,
         "forecast_dir":  fcd,
@@ -172,7 +172,7 @@ def generate_rows(event_id: int, currency: str, importance: str,
 
     for mode in (0, 1):
         yield (
-            make_weight_code(currency, importance, fcd, scd, rcd, mode),
+            make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode),
             event_id, currency, importance, fcd, scd, rcd,
             mode, None, occ,
         )
@@ -181,7 +181,7 @@ def generate_rows(event_id: int, currency: str, importance: str,
         for shift in range(SHIFT_MIN, SHIFT_MAX + 1):
             for mode in (0, 1):
                 yield (
-                    make_weight_code(currency, importance, fcd, scd, rcd,
+                    make_weight_code(event_id, currency, importance, fcd, scd, rcd,
                                      mode, shift),
                     event_id, currency, importance, fcd, scd, rcd,
                     mode, shift, occ,
@@ -289,20 +289,18 @@ def main():
             LIMIT 20
         """)
         rows = cur.fetchall()
-        print(f"  {'weight_code':<30} {'evt':>7} {'curr':<5} {'imp':<5} "
+        print(f"  {'weight_code':<38} {'evt':>7} {'curr':<5} {'imp':<5} "
               f"{'fcd':<7} {'scd':<7} {'rcd':<6} {'mode':>4} {'shift':>6} {'occ':>5}")
-        print("  " + "─" * 88)  # чуть короче из-за меньшей длины кода
+        print("  " + "─" * 96)
         for wc, eid, cur_c, imp, fcd, scd, rcd, mv, ds, oc in rows:
-            print(f"  {wc:<30} {eid:>7} {cur_c:<5} {imp:<5} "
+            print(f"  {wc:<38} {eid:>7} {cur_c:<5} {imp:<5} "
                   f"{fcd:<7} {scd:<7} {rcd:<6} {mv:>4} {str(ds):>6} {str(oc):>5}")
 
         if rows:
-            sample_code = rows[0][0]
-            sample_event = rows[0][1]
+            sample = rows[0][0]
             print(f"\n── Пример декодирования ────────────────────────────────────────")
-            print(f"  Код: {sample_code} (event_id={sample_event})")
-            decoded = decode_weight_code(sample_code)
-            print(f"  Расшифровка: {decoded}")
+            print(f"  Код: {sample}")
+            print(f"  Расшифровка: {decode_weight_code(sample)}")
 
         cur.close()
         print("\nГотово.")
