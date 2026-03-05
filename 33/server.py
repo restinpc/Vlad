@@ -438,6 +438,8 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
     # Собираем все события из окна
     observations = []
     for dt in check_dts:
+        if dt > target_date:
+            continue
         for ctx_key in GLOBAL_CAL_BY_DT.get(dt, []):
             shift_steps = round((target_date - dt) / delta_unit)
             observations.append((ctx_key, dt, shift_steps))
@@ -453,7 +455,59 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
 
     result = {}
 
-    for (event_id, currency, importance, fcd, scd, rcd), obs_dt, shift in observations:
+    for obs in observations:
+        # Проверяем, что наблюдение состоит из трёх элементов
+        if len(obs) != 3:
+            continue
+        ctx_key, obs_dt, shift = obs
+        # Проверяем, что ключ контекста — кортеж из 6 элементов
+        if not isinstance(ctx_key, tuple) or len(ctx_key) != 6:
+            continue
+        event_id, currency, importance, fcd, scd, rcd = ctx_key
+
+        # Далее идёт оригинальное тело цикла (без изменений)
+        ctx_key_full = (event_id, currency, importance, fcd, scd, rcd)
+        ctx_info = GLOBAL_CAL_CTX_INDEX.get(ctx_key_full)
+        if ctx_info is None:
+            continue
+
+        is_recurring = ctx_info["occurrence_count"] >= RECURRING_MIN_COUNT
+
+        if not is_recurring and shift != 0:
+            continue
+        if is_recurring and abs(shift) > SHIFT_WINDOW:
+            continue
+
+        all_ctx_dts = GLOBAL_CAL_CTX_HIST.get(ctx_key_full, [])
+        idx = bisect.bisect_left(all_ctx_dts, target_date)
+        valid_dts = all_ctx_dts[:idx]
+        if not valid_dts:
+            continue
+
+        t_dates = [
+            d + delta_unit * shift
+            for d in valid_dts
+            if d + delta_unit * shift <= target_date
+        ]
+        shift_arg = shift if is_recurring else None
+
+        if calc_type in (0, 1):
+            t1_sum = compute_t1_value(
+                t_dates, calc_var, ram_rates, ram_ranges, avg_range)
+            wc = make_weight_code(event_id, currency, importance,
+                                  fcd, scd, rcd, 0, shift_arg)
+            result[wc] = result.get(wc, 0.0) + t1_sum
+
+        if calc_type in (0, 2) and prev_candle:
+            _, is_bull = prev_candle
+            ext_set = ram_ext["max" if is_bull else "min"]
+            ext_val = compute_extremum_value(
+                t_dates, calc_var, ext_set, ram_ranges, avg_range,
+                modification, len(valid_dts))
+            if ext_val is not None:
+                wc = make_weight_code(event_id, currency, importance,
+                                      fcd, scd, rcd, 1, shift_arg)
+                result[wc] = result.get(wc, 0.0) + ext_val
         ctx_key  = (event_id, currency, importance, fcd, scd, rcd)
         ctx_info = GLOBAL_CAL_CTX_INDEX.get(ctx_key)
         if ctx_info is None:
@@ -473,7 +527,11 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
         if not valid_dts:
             continue
 
-        t_dates   = [d + delta_unit * shift for d in valid_dts]
+        t_dates = [
+            d + delta_unit * shift
+            for d in valid_dts
+            if d + delta_unit * shift <= target_date
+        ]
         shift_arg = shift if is_recurring else None
 
         # mode=0: T1
@@ -535,7 +593,7 @@ async def get_metadata():
         try:
             res = await conn.execute(text(
                 "SELECT version FROM version_microservice "
-                "WHERE microservice_id = 32"))
+                "WHERE microservice_id = 33"))
             row = res.fetchone()
             version = row[0] if row else 0
         except Exception as e:
