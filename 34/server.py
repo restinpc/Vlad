@@ -10,7 +10,7 @@ from sqlalchemy import text
 from dotenv import load_dotenv
 
 # ====================== КОНФИГУРАЦИЯ ======================
-MODEL_A_ID = 23  # ← первая модель (A)
+MODEL_A_ID = 31  # ← первая модель (A)
 MODEL_B_ID = 32  # ← вторая модель (B)
 SERVICE_ID = 34  # ← id этой комплексной модели в vlad.version_microservice
 
