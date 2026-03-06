@@ -10,7 +10,7 @@ from sqlalchemy import text
 from dotenv import load_dotenv
 
 # ====================== КОНФИГУРАЦИЯ ======================
-MODEL_A_ID = 31  # ← первая модель (A)
+MODEL_A_ID = 23  # ← первая модель (A)
 MODEL_B_ID = 32  # ← вторая модель (B)
 SERVICE_ID = 34  # ← id этой комплексной модели в vlad.version_microservice
 
@@ -73,6 +73,21 @@ async def lifespan(app: FastAPI):
     print(f"✅ Загружены URL из brain_service:")
     print(f"   {MODEL_A_ID} → {app.state.URL_A}")
     print(f"   {MODEL_B_ID} → {app.state.URL_B}")
+
+    # Определяем, какие поля параметров существуют в таблицах сигналов
+    async with engine_brain.connect() as conn:
+        # Для модели A
+        result_a = await conn.execute(text(f"DESCRIBE `brain_signal{MODEL_A_ID}`"))
+        cols_a = [row[0] for row in result_a.fetchall() if row[0] in ('type', 'var', 'param')]
+        app.state.cols_A = cols_a
+
+        # Для модели B
+        result_b = await conn.execute(text(f"DESCRIBE `brain_signal{MODEL_B_ID}`"))
+        cols_b = [row[0] for row in result_b.fetchall() if row[0] in ('type', 'var', 'param')]
+        app.state.cols_B = cols_b
+
+    print(f"✅ Поля сигналов модели {MODEL_A_ID}: {app.state.cols_A}")
+    print(f"✅ Поля сигналов модели {MODEL_B_ID}: {app.state.cols_B}")
 
     yield
     await engine_vlad.dispose()
@@ -137,15 +152,21 @@ async def get_values(
         k = subp.get("k")
         if k is None:
             raise HTTPException(status_code=400, detail="Missing k in params")
-        t = subp.get("type", 0)
-        v = subp.get("var", 0)
 
-        url = app.state.URL_A if model_id == MODEL_A_ID else app.state.URL_B if model_id == MODEL_B_ID else None
-        if not url:
-            continue
+        # Определяем URL нужной модели
+        if model_id == MODEL_A_ID:
+            url = app.state.URL_A
+        elif model_id == MODEL_B_ID:
+            url = app.state.URL_B
+        else:
+            continue  # неизвестная модель – пропускаем
+
+        # Готовим параметры для запроса к дочернему микросервису (все кроме k)
+        query_params = {key: val for key, val in subp.items() if key != 'k'}
+        query_params.update({'pair': pair, 'day': day, 'date': date})
 
         try:
-            r = requests.get(f"{url}/values?pair={pair}&day={day}&date={date}&type={t}&var={v}")
+            r = requests.get(f"{url}/values", params=query_params)
             res = r.json()
             if "error" in res:
                 return res
@@ -165,7 +186,7 @@ async def get_params(
 ):
     max_per_model = 4 if tier == 0 else 3
 
-    # Лучшие сигналы
+    # Получаем ранжированные списки сигналов от best.php
     try:
         best_a = requests.get(f"{BEST_URL}?neuronet_id={MODEL_A_ID}&pair={pair}&day={day}").json()
         best_b = requests.get(f"{BEST_URL}?neuronet_id={MODEL_B_ID}&pair={pair}&day={day}").json()
@@ -178,35 +199,56 @@ async def get_params(
     TABLE_A = f"brain_signal{MODEL_A_ID}"
     TABLE_B = f"brain_signal{MODEL_B_ID}"
 
+    # Загружаем параметры сигналов из БД, используя только существующие поля
     params_a = []
     params_b = []
 
     async with engine_brain.connect() as conn:
+        # Для модели A
         for sid in sorted_a:
             if len(params_a) >= max_per_model:
                 break
-            res = await conn.execute(text(f"""
-                SELECT type, var FROM `{TABLE_A}` 
-                WHERE id = :sid AND tier = :tier AND is_day = :day
-            """), {"sid": sid, "tier": tier, "day": day})
-            row = res.fetchone()
-            if row:
-                params_a.append({"type": int(row[0]), "var": int(row[1])})
+            # Динамическое построение SELECT на основе сохранённых полей
+            if app.state.cols_A:
+                cols_str = ", ".join(app.state.cols_A)
+                query = text(f"SELECT {cols_str} FROM `{TABLE_A}` WHERE id = :sid AND tier = :tier AND is_day = :day")
+                res = await conn.execute(query, {"sid": sid, "tier": tier, "day": day})
+                row = res.fetchone()
+                if row:
+                    # Строим объект параметров, добавляя только существующие поля
+                    param_obj = {}
+                    for idx, col in enumerate(app.state.cols_A):
+                        value = row[idx]
+                        if col == 'param' and value is not None:
+                            # Оборачиваем param в список, как в примере
+                            param_obj[col] = [value]
+                        else:
+                            param_obj[col] = value
+                    params_a.append(param_obj)
 
+        # Для модели B
         for sid in sorted_b:
             if len(params_b) >= max_per_model:
                 break
-            res = await conn.execute(text(f"""
-                SELECT type, var FROM `{TABLE_B}` 
-                WHERE id = :sid AND tier = :tier AND is_day = :day
-            """), {"sid": sid, "tier": tier, "day": day})
-            row = res.fetchone()
-            if row:
-                params_b.append({"type": int(row[0]), "var": int(row[1])})
+            if app.state.cols_B:
+                cols_str = ", ".join(app.state.cols_B)
+                query = text(f"SELECT {cols_str} FROM `{TABLE_B}` WHERE id = :sid AND tier = :tier AND is_day = :day")
+                res = await conn.execute(query, {"sid": sid, "tier": tier, "day": day})
+                row = res.fetchone()
+                if row:
+                    param_obj = {}
+                    for idx, col in enumerate(app.state.cols_B):
+                        value = row[idx]
+                        if col == 'param' and value is not None:
+                            param_obj[col] = [value]
+                        else:
+                            param_obj[col] = value
+                    params_b.append(param_obj)
 
     # Генерация комбинаций
     combs = []
     if tier == 0:
+        # Фиксированный коэффициент 0.5 для обоих
         for pa in params_a:
             for pb in params_b:
                 combs.append({
@@ -214,6 +256,7 @@ async def get_params(
                     str(MODEL_B_ID): {**pb, "k": 0.5}
                 })
     else:
+        # Плавающий коэффициент с шагом 0.1
         for pa in params_a:
             for pb in params_b:
                 for ki in range(1, 10):
