@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import text
 from dotenv import load_dotenv
 import bisect
-from cache.cache_mixin import CacheMixin
 
 # === Конфигурация трассировки ошибок ===
 TRACE_URL = "https://server.brain-project.online/trace.php"
@@ -332,12 +331,6 @@ async def calculate_pure_memory(pair, day, date_str):
 
     return {k: round(v, 6) for k, v in raw_result.items() if v != 0}
 
-SERVICE_PORT = 8890
-cache = CacheMixin(
-    engine=engine_vlad,
-    service_port=SERVICE_PORT,
-    realtime_window_hours=6   # даты моложе 6 часов считаем real-time
-)
 
 @app.post("/patch")
 async def patch_service():
@@ -440,27 +433,56 @@ async def get_weights():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/new_weights")
+async def get_new_weights(code: str = Query(...)):
+    try:
+        parts = code.split("_")
+        if len(parts) < 3:
+            raise HTTPException(status_code=400, detail="Invalid weight_code format")
+
+        try:
+            target_eid = int(parts[0])
+            target_etype = int(parts[1])
+            target_mval = int(parts[2])
+            target_hshift = int(parts[3]) if len(parts) > 3 else None
+        except ValueError:
+            raise HTTPException(status_code=400, detail="All components must be integers")
+
+        async with engine_vlad.connect() as conn:
+            query = """
+                SELECT weight_code
+                FROM vlad_weight_codes
+                WHERE (EventId, event_type, mode_val, COALESCE(hour_shift, -999999)) 
+                      > (:eid, :etype, :mval, :hshift)
+                ORDER BY EventId, event_type, mode_val, hour_shift IS NULL, hour_shift
+            """
+            res = await conn.execute(
+                text(query),
+                {
+                    "eid": target_eid,
+                    "etype": target_etype,
+                    "mval": target_mval,
+                    "hshift": target_hshift if target_hshift is not None else -999999
+                }
+            )
+            rows = res.mappings().all()
+            return {"weights": [r["weight_code"] for r in rows]}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        send_error_trace(e, "get_new_weights")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/values")
-@app.get("/values")
-async def get_values(
-    pair: int = Query(1),
-    day: int = Query(0),
-    date: str = Query(...)
-):
-    return await cache.cached_values(
-        pair=pair,
-        day=day,
-        date_str=date,
-        calc_type=0,          # для этого сервиса type всегда 0
-        calc_var=0,           # var всегда 0
-        compute_fn=lambda: calculate_pure_memory(pair, day, date),   # твоя оригинальная функция
-        parse_date_fn=parse_date_string   # если есть свой парсер дат
-    )
+async def get_values(pair: int = Query(1), day: int = Query(0), date: str = Query(...)):
+    return await calculate_pure_memory(pair, day, date)
 
 
 if __name__ == "__main__":
     try:
-        uvicorn.run("server:app", host="0.0.0.0", port=8888, reload=False, workers=4)
+        uvicorn.run("server:app", host="0.0.0.0", port=8888, reload=False, workers=1)
     except KeyboardInterrupt:
         print("\n🛑 Сервер остановлен пользователем")
     except SystemExit:

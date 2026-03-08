@@ -1,6 +1,5 @@
 ﻿import asyncio
 import argparse
-import datetime
 import logging
 import os
 import signal
@@ -8,7 +7,7 @@ import sys
 import traceback
 import requests
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, String, Text, TIMESTAMP
+from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from telethon import TelegramClient, events
 
@@ -20,13 +19,11 @@ API_HASH = os.getenv("API_HASH", "2152018f5ca2fa91b67c5dbf589f89e7")
 PHONE = os.getenv("PHONE", "+79330941672")
 
 TARGET_BOT = "@Bybit_TradeGPT_bot"
-QUERIES = ['/gpt ETH trend now', '/gpt BTC trend now']
 
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 3600))
 RESPONSE_TIMEOUT = int(os.getenv("RESPONSE_TIMEOUT", 30))
 MAX_WAIT = int(os.getenv("MAX_WAIT", 120))
 
-SESSION_FILE = os.getenv("SESSION_FILE", "/brain/Brain-Services/parser/Tg_Bybit/test_session")
+SESSION_FILE = os.getenv("SESSION_FILE", "/brain/Brain-Services/parser/test_session")
 
 TRACE_URL = os.getenv("TRACE_URL", "https://server.brain-project.online/trace.php")
 NODE_NAME = os.getenv("NODE_NAME", "bybit_trend_bot")
@@ -120,10 +117,9 @@ async def collect_response(bot_id: int, query: str) -> str:
 def ensure_table_exists(engine, table_name, database_name):
     """
     Проверяет наличие таблицы, создаёт её при отсутствии.
-    Дополнительно проверяет наличие первичного ключа и уникальных индексов (не обязательно).
+    Дополнительно проверяет наличие первичного ключа (не обязательно).
     """
     with engine.connect() as conn:
-        # Проверка существования таблицы
         result = conn.execute(text(f"""
             SELECT COUNT(*) FROM information_schema.tables
             WHERE table_schema = '{database_name}' AND table_name = '{table_name}'
@@ -131,7 +127,6 @@ def ensure_table_exists(engine, table_name, database_name):
         table_exists = result.scalar() > 0
 
     if not table_exists:
-        # Создание таблицы с нужной структурой
         create_query = text(f"""
         CREATE TABLE {table_name} (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -145,7 +140,6 @@ def ensure_table_exists(engine, table_name, database_name):
             conn.commit()
         log.info(f"✅ Таблица '{table_name}' успешно создана")
     else:
-        # Опционально: проверим наличие первичного ключа (для совместимости)
         with engine.connect() as conn:
             result = conn.execute(text(f"""
                 SELECT COUNT(*) FROM information_schema.statistics
@@ -210,30 +204,11 @@ async def process_query(query: str, bot_id: int, engine, table_name):
         return None
 
 
-async def run_cycle(bot_id: int, engine, table_name):
-    """Один цикл опроса всех запросов."""
-    log.info("🔄 Запуск цикла опроса")
-    for query in QUERIES:
-        await process_query(query, bot_id, engine, table_name)
-        await asyncio.sleep(5)
-    log.info(f"⏳ Следующий цикл через {POLL_INTERVAL} сек")
-
-
-async def scheduler(bot_id: int, engine, table_name):
-    """Планировщик, выполняющий циклы с заданным интервалом."""
-    while not shutdown.is_set():
-        await run_cycle(bot_id, engine, table_name)
-        try:
-            await asyncio.wait_for(shutdown.wait(), timeout=POLL_INTERVAL)
-        except asyncio.TimeoutError:
-            pass
-
-
 # ==================== ТОЧКА ВХОДА ====================
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Сбор ответов от @Bybit_TradeGPT_bot с сохранением в MySQL"
+        description="Однократный сбор ответа от @Bybit_TradeGPT_bot с сохранением в MySQL"
     )
     parser.add_argument("table_name", help="Имя целевой таблицы в БД")
     parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST", "localhost"))
@@ -241,26 +216,27 @@ def parse_args():
     parser.add_argument("user", nargs="?", default=os.getenv("DB_USER", "root"))
     parser.add_argument("password", nargs="?", default=os.getenv("DB_PASSWORD", ""))
     parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME", "test"))
-    parser.add_argument("--poll-interval", type=int, default=POLL_INTERVAL,
-                        help="Интервал опроса в секундах")
-    parser.add_argument("--queries", nargs="+", default=QUERIES,
-                        help="Список запросов для отправки")
+    # Все оставшиеся аргументы объединяются в одну строку запроса
+    parser.add_argument("query", nargs=argparse.REMAINDER, help="Текст запроса (можно писать без кавычек, всё после database будет объединено)")
     return parser.parse_args()
 
 
 async def main_async(args):
-    # Формируем URL подключения (как в первом скрипте)
+    # Объединяем части запроса в одну строку
+    if not args.query:
+        log.error("❌ Не указан текст запроса")
+        sys.exit(1)
+    query_str = ' '.join(args.query)
+
     db_url = f"mysql+mysqlconnector://{args.user}:{args.password}@{args.host}:{args.port}/{args.database}"
     engine = create_engine(
         db_url,
         pool_recycle=3600,
-        connect_args={"auth_plugin": "caching_sha2_password"}  # оставляем для совместимости
+        connect_args={"auth_plugin": "caching_sha2_password"}
     )
 
-    # Создаём/проверяем таблицу, передавая имя БД для information_schema
     ensure_table_exists(engine, args.table_name, args.database)
 
-    # Подключаемся к Telegram
     await client.connect()
     if not await client.is_user_authorized():
         log.error("❌ Нет активной сессии. Сначала авторизуйтесь вручную или удалите сессионный файл и запустите с QR-кодом.")
@@ -271,7 +247,6 @@ async def main_async(args):
 
     bot_entity = await client.get_entity(TARGET_BOT)
 
-    # Устанавливаем обработчики сигналов для корректного завершения
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -279,8 +254,8 @@ async def main_async(args):
         except NotImplementedError:
             pass
 
-    log.info(f"🤖 Бот запущен. Опрос каждые {args.poll_interval} сек")
-    await scheduler(bot_entity.id, engine, args.table_name)
+    log.info(f"📨 Запрос: {query_str}")
+    await process_query(query_str, bot_entity.id, engine, args.table_name)
 
     await client.disconnect()
     log.info("👋 Соединение закрыто")
@@ -288,17 +263,12 @@ async def main_async(args):
 
 def main():
     args = parse_args()
-    # Переопределяем глобальные переменные, если они переданы через аргументы
-    global POLL_INTERVAL, QUERIES
-    POLL_INTERVAL = args.poll_interval
-    QUERIES = args.queries
 
     log.info("=" * 60)
-    log.info("🚀 Запуск сборщика ответов Bybit")
+    log.info("🚀 Однократный сборщик ответов Bybit")
     log.info(f"База: {args.host}:{args.port}/{args.database}")
     log.info(f"Таблица: {args.table_name}")
-    log.info(f"Запросы: {QUERIES}")
-    log.info(f"Интервал опроса: {POLL_INTERVAL} сек")
+    log.info(f"Запрос: {' '.join(args.query) if args.query else 'Не указан'}")
     log.info("=" * 60)
 
     try:
