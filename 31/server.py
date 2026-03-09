@@ -509,6 +509,8 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
         t_dates = [d + delta_unit * shift for d in valid_dts]
         shift_arg = shift if is_recurring else None
 
+        pprint(t_dates);
+
         # mode=0: T1
         if calc_type in (0, 1):
             t1_sum = compute_t1_value(
