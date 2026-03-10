@@ -3,7 +3,6 @@ import os
 import asyncio
 import traceback
 import requests
-from pprint import pprint
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date as date_type, time as time_type
 from fastapi import FastAPI, HTTPException, Query
@@ -507,11 +506,8 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
             continue
 
         # Применяем сдвиг к историческим датам
-        t_dates = [d + delta_unit * shift for d in valid_dts]
+        t_dates = [d + delta_unit * shift for d in valid_dts if (d + delta_unit * shift) < target_date]
         shift_arg = shift if is_recurring else None
-
-        # Валидация дат
-        # pprint(t_dates);
 
         # mode=0: T1
         if calc_type in (0, 1):
@@ -661,9 +657,10 @@ async def patch_service():
 # ── Точка входа ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
+        _workers = int(os.getenv("WORKERS", "1"))
         uvicorn.run("server:app",
                     host="0.0.0.0", port=8894,
-                    reload=False, workers=8)
+                    reload=False, workers=_workers)
     except KeyboardInterrupt:
         print("\n🛑 Сервер остановлен")
     except SystemExit:

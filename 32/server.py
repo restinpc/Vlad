@@ -290,7 +290,7 @@ async def calculate_pure_memory(pair, day, date_str, type_=0, var=0):
         key1 = f"{e['EventId']}_{evt_type}_1" + (f"_{shift}" if evt_type == 1 else "")
 
         delta = timedelta(hours=shift) if day == 0 else timedelta(days=shift)
-        t_dates = [d + delta for d in valid_dates]
+        t_dates = [d + delta for d in valid_dates if (d + delta) < target_date]
 
         if size_threshold > 0:
             filtered_t_dates = [
@@ -422,7 +422,8 @@ async def get_new_weights(code: str = Query(...)):
 
 if __name__ == "__main__":
     try:
-        uvicorn.run("server:app", host="0.0.0.0", port=8895, reload=False, workers=8)
+        _workers = int(os.getenv("WORKERS", "1"))
+        uvicorn.run("server:app", host="0.0.0.0", port=8895, reload=False, workers=_workers)
     except KeyboardInterrupt:
         print("\n🛑 Сервер остановлен пользователем")
     except SystemExit:

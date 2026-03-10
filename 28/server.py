@@ -415,9 +415,9 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
             continue
 
         t_dates = (
-            [d + timedelta(hours=shift) for d in valid_dates]
+            [d + timedelta(hours=shift) for d in valid_dates if (d + timedelta(hours=shift)) < target_date]
             if day == 0 else
-            [d + timedelta(days=shift)  for d in valid_dates]
+            [d + timedelta(days=shift)  for d in valid_dates if (d + timedelta(days=shift))  < target_date]
         )
 
         # Суффикс часа только для recurring
@@ -472,7 +472,7 @@ async def get_metadata():
     async with engine_vlad.connect() as conn:
         try:
             res = await conn.execute(
-                text("SELECT version FROM version_microservice WHERE microservice_id = 25"))
+                text("SELECT version FROM version_microservice WHERE microservice_id = 28"))
             row = res.fetchone()
             version = row[0] if row else 0
         except Exception as e:
@@ -502,6 +502,42 @@ async def get_metadata():
 async def get_weights():
     return {"weights": GLOBAL_WEIGHT_CODES, "total": len(GLOBAL_WEIGHT_CODES)}
 
+@app.get("/new_weights")
+async def get_new_weights(code: str = Query(...)):
+    parts = code.split("__")
+    if len(parts) < 5:
+        raise HTTPException(status_code=400, detail="Invalid weight_code format")
+    try:
+        event_id = int(parts[0])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="event_id must be an integer")
+
+    fdir, sdir, adir = parts[1], parts[2], parts[3]
+    try:
+        mode = int(parts[4])
+        hour = int(parts[5]) if len(parts) > 5 else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="mode/hour must be integers")
+
+    async with engine_vlad.connect() as conn:
+        query = """
+            SELECT weight_code FROM vlad_investing_weights
+            WHERE (event_id, forecast_direction, surprise_direction, actual_direction,
+                   mode, COALESCE(hour, -999999))
+                   > (:event_id, :fdir, :sdir, :adir, :mode, :hour)
+            ORDER BY event_id,
+                     forecast_direction, surprise_direction, actual_direction,
+                     mode, hour IS NULL, hour
+        """
+        res = await conn.execute(text(query), {
+            "event_id": event_id,
+            "fdir":     fdir,
+            "sdir":     sdir,
+            "adir":     adir,
+            "mode":     mode,
+            "hour":     hour if hour is not None else -999999,
+        })
+        return {"weights": [r["weight_code"] for r in res.mappings().all()]}
 
 @app.get("/values")
 async def get_values(
@@ -536,7 +572,8 @@ async def patch_service():
 # ── Точка входа ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
-        uvicorn.run("server:app", host="0.0.0.0", port=8892, reload=False, workers=1)
+        _workers = int(os.getenv("WORKERS", "1"))
+        uvicorn.run("server:app", host="0.0.0.0", port=8892, reload=False, workers=_workers)
     except KeyboardInterrupt:
         print("\n🛑 Сервер остановлен")
     except SystemExit:

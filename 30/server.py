@@ -40,7 +40,7 @@ NODE_NAME = os.getenv("NODE_NAME", "brain-ecb-weights-microservice")
 EMAIL     = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
 
-def send_error_trace(exc: Exception, script_name: str = "ecb_rate_server.py"):
+def send_error_trace(exc: Exception, script_name: str = "server.py"):
     logs = (
         f"Node: {NODE_NAME}\nScript: {script_name}\n"
         f"Exception: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
@@ -460,9 +460,9 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
 
         # Сдвигаем и конвертируем в datetime для lookup в brain-таблице
         t_dates = [
-            datetime.combine(d + timedelta(days=shift),
-                             time_type(0, 0))
+            datetime.combine(d + timedelta(days=shift), time_type(0, 0))
             for d in valid_dates
+            if datetime.combine(d + timedelta(days=shift), time_type(0, 0)) < target_date  # look-ahead fix
         ]
 
         day_shift_arg = shift if is_recurring else None
@@ -607,9 +607,10 @@ async def patch_service():
 # ── Точка входа ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
+        _workers = int(os.getenv("WORKERS", "1"))
         uvicorn.run("server:app",
                      host="0.0.0.0", port=8893,
-                     reload=False, workers=1)
+                     reload=False, workers=_workers)
     except KeyboardInterrupt:
         print("\n🛑 Сервер остановлен")
     except SystemExit:

@@ -87,7 +87,6 @@ def get_modification_factor(pair_id):
 
 
 def parse_date_string(date_str):
-    """Поддержка 4 форматов даты"""
     date_str = date_str.strip()
     formats = [
         "%Y-%d-%m %H:%M:%S",
@@ -312,7 +311,7 @@ async def calculate_pure_memory(pair, day, date_str):
         key1 = f"{evt_id}_{evt_type}_1" + (f"_{shift}" if evt_type == 1 else "")
 
         delta = timedelta(hours=shift) if day == 0 else timedelta(days=shift)
-        t_dates = [d + delta for d in valid_h_dates]
+        t_dates = [d + delta for d in valid_h_dates if (d + delta) < target_date]
 
         sum_t1 = 0
         for td in t_dates:
@@ -330,7 +329,6 @@ async def calculate_pure_memory(pair, day, date_str):
                 raw_result[key1] = ((matches / total) * 2 - 1) * modification
 
     return {k: round(v, 6) for k, v in raw_result.items() if v != 0}
-
 
 @app.post("/patch")
 async def patch_service():
@@ -364,6 +362,7 @@ async def patch_service():
         print(f"❌ Error in patch_service: {e}")
         send_error_trace(e, "patch_service")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/")
@@ -432,7 +431,6 @@ async def get_weights():
         send_error_trace(e, "get_weights")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/new_weights")
 async def get_new_weights(code: str = Query(...)):
     try:
@@ -474,7 +472,6 @@ async def get_new_weights(code: str = Query(...)):
         send_error_trace(e, "get_new_weights")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/values")
 async def get_values(pair: int = Query(1), day: int = Query(0), date: str = Query(...)):
     return await calculate_pure_memory(pair, day, date)
@@ -482,7 +479,8 @@ async def get_values(pair: int = Query(1), day: int = Query(0), date: str = Quer
 
 if __name__ == "__main__":
     try:
-        uvicorn.run("server:app", host="0.0.0.0", port=8888, reload=False, workers=1)
+        _workers = int(os.getenv("WORKERS", "4"))
+        uvicorn.run("server:app", host="0.0.0.0", port=8888, reload=False, workers=_workers)
     except KeyboardInterrupt:
         print("\n🛑 Сервер остановлен пользователем")
     except SystemExit:

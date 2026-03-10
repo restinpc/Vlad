@@ -4,7 +4,6 @@ import asyncio
 import bisect
 import traceback
 import requests
-from pprint import pprint
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Query
@@ -456,60 +455,9 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
 
     result = {}
 
-    for obs in observations:
-        # Проверяем, что наблюдение состоит из трёх элементов
-        if len(obs) != 3:
-            continue
-        ctx_key, obs_dt, shift = obs
-        # Проверяем, что ключ контекста — кортеж из 6 элементов
-        if not isinstance(ctx_key, tuple) or len(ctx_key) != 6:
-            continue
+    for ctx_key, obs_dt, shift in observations:
         event_id, currency, importance, fcd, scd, rcd = ctx_key
 
-        # Далее идёт оригинальное тело цикла (без изменений)
-        ctx_key_full = (event_id, currency, importance, fcd, scd, rcd)
-        ctx_info = GLOBAL_CAL_CTX_INDEX.get(ctx_key_full)
-        if ctx_info is None:
-            continue
-
-        is_recurring = ctx_info["occurrence_count"] >= RECURRING_MIN_COUNT
-
-        if not is_recurring and shift != 0:
-            continue
-        if is_recurring and abs(shift) > SHIFT_WINDOW:
-            continue
-
-        all_ctx_dts = GLOBAL_CAL_CTX_HIST.get(ctx_key_full, [])
-        idx = bisect.bisect_left(all_ctx_dts, target_date)
-        valid_dts = all_ctx_dts[:idx]
-        if not valid_dts:
-            continue
-
-        t_dates = [
-            d + delta_unit * shift
-            for d in valid_dts
-            if d + delta_unit * shift <= target_date
-        ]
-        shift_arg = shift if is_recurring else None
-
-        if calc_type in (0, 1):
-            t1_sum = compute_t1_value(
-                t_dates, calc_var, ram_rates, ram_ranges, avg_range)
-            wc = make_weight_code(event_id, currency, importance,
-                                  fcd, scd, rcd, 0, shift_arg)
-            result[wc] = result.get(wc, 0.0) + t1_sum
-
-        if calc_type in (0, 2) and prev_candle:
-            _, is_bull = prev_candle
-            ext_set = ram_ext["max" if is_bull else "min"]
-            ext_val = compute_extremum_value(
-                t_dates, calc_var, ext_set, ram_ranges, avg_range,
-                modification, len(valid_dts))
-            if ext_val is not None:
-                wc = make_weight_code(event_id, currency, importance,
-                                      fcd, scd, rcd, 1, shift_arg)
-                result[wc] = result.get(wc, 0.0) + ext_val
-        ctx_key  = (event_id, currency, importance, fcd, scd, rcd)
         ctx_info = GLOBAL_CAL_CTX_INDEX.get(ctx_key)
         if ctx_info is None:
             continue
@@ -521,7 +469,6 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
         if is_recurring and abs(shift) > SHIFT_WINDOW:
             continue
 
-        # Исторические datetime с тем же контекстом ДО target_date
         all_ctx_dts = GLOBAL_CAL_CTX_HIST.get(ctx_key, [])
         idx = bisect.bisect_left(all_ctx_dts, target_date)
         valid_dts = all_ctx_dts[:idx]
@@ -531,14 +478,10 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
         t_dates = [
             d + delta_unit * shift
             for d in valid_dts
-            if d + delta_unit * shift <= target_date
+            if d + delta_unit * shift < target_date
         ]
         shift_arg = shift if is_recurring else None
 
-        # Валидация дат
-        # pprint(t_dates)
-
-        # mode=0: T1
         if calc_type in (0, 1):
             t1_sum = compute_t1_value(
                 t_dates, calc_var, ram_rates, ram_ranges, avg_range)
@@ -546,7 +489,6 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
                                   fcd, scd, rcd, 0, shift_arg)
             result[wc] = result.get(wc, 0.0) + t1_sum
 
-        # mode=1: Extremum
         if calc_type in (0, 2) and prev_candle:
             _, is_bull = prev_candle
             ext_set = ram_ext["max" if is_bull else "min"]
@@ -646,6 +588,51 @@ async def get_weights():
     return {"weights": GLOBAL_WEIGHT_CODES,
             "total":   len(GLOBAL_WEIGHT_CODES)}
 
+@app.get("/new_weights")
+async def get_new_weights(code: str = Query(...)):
+    if not code.startswith("E"):
+        raise HTTPException(status_code=400, detail="weight_code must start with 'E'")
+
+    parts = code[1:].split("_")
+    if len(parts) < 7:
+        raise HTTPException(status_code=400, detail="Invalid weight_code format")
+    try:
+        event_id = int(parts[0])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="event_id must be an integer")
+
+    currency = parts[1]
+    imp_c    = parts[2]
+    fcd_c    = parts[3]
+    scd_c    = parts[4]
+    rcd_c    = parts[5]
+    try:
+        mode       = int(parts[6])
+        hour_shift = int(parts[7]) if len(parts) > 7 else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="mode/hour_shift must be integers")
+
+    async with engine_vlad.connect() as conn:
+        query = """
+            SELECT weight_code FROM brain_calendar_weights
+            WHERE (event_id, currency, imp_c, fcd_c, scd_c, rcd_c,
+                   mode, COALESCE(hour_shift, -999999))
+                   > (:event_id, :currency, :imp_c, :fcd_c, :scd_c, :rcd_c,
+                      :mode, :hour_shift)
+            ORDER BY event_id, currency, imp_c, fcd_c, scd_c, rcd_c,
+                     mode, hour_shift IS NULL, hour_shift
+        """
+        res = await conn.execute(text(query), {
+            "event_id":   event_id,
+            "currency":   currency,
+            "imp_c":      imp_c,
+            "fcd_c":      fcd_c,
+            "scd_c":      scd_c,
+            "rcd_c":      rcd_c,
+            "mode":       mode,
+            "hour_shift": hour_shift if hour_shift is not None else -999999,
+        })
+        return {"weights": [r["weight_code"] for r in res.mappings().all()]}
 
 @app.get("/values")
 async def get_values(
@@ -689,9 +676,10 @@ async def patch_service():
 
 if __name__ == "__main__":
     try:
+        _workers = int(os.getenv("WORKERS", "1"))
         uvicorn.run("server:app",
                     host="0.0.0.0", port=8896,
-                    reload=False, workers=1)
+                    reload=False, workers=_workers)
     except KeyboardInterrupt:
         print("\n🛑 Сервер остановлен")
     except SystemExit:

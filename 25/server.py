@@ -84,7 +84,6 @@ def get_rates_table_name(pair_id, day_flag):
     }
     return f"{table_map.get(pair_id, 'brain_rates_eur_usd')}{suffix}"
 
-
 def get_modification_factor(pair_id):
     if pair_id == 1: return 0.001
     if pair_id == 3: return 1000.0
@@ -105,7 +104,6 @@ def parse_date_string(date_str):
         except ValueError:
             continue
     return None
-
 
 async def preload_all_data():
     global LAST_RELOAD_TIME
@@ -179,7 +177,6 @@ async def preload_all_data():
 
     LAST_RELOAD_TIME = datetime.now()
     print("✅ FULL DATA RELOAD COMPLETED")
-
 
 async def background_reload_data():
     while True:
@@ -259,7 +256,8 @@ async def calculate_pure_memory(pair, day, date_str):
         key0 = f"{e['EventId']}_{evt_type}_0" + (f"_{shift}" if evt_type == 1 else "")
         key1 = f"{e['EventId']}_{evt_type}_1" + (f"_{shift}" if evt_type == 1 else "")
 
-        t_dates = [d + (timedelta(hours=shift) if day == 0 else timedelta(days=shift)) for d in valid_dates]
+        _delta = timedelta(hours=shift) if day == 0 else timedelta(days=shift)
+        t_dates = [d + _delta for d in valid_dates if (d + _delta) < target_date]
         sum_t1 = sum(ram_rates.get(td, 0) for td in t_dates)
         result[key0] = sum_t1
 
@@ -380,7 +378,8 @@ async def get_new_weights(code: str = Query(...)):
 # === Точка входа ===
 if __name__ == "__main__":
     try:
-        uvicorn.run("server:app", host="0.0.0.0", port=8890, reload=False, workers=1)
+        _workers = int(os.getenv("WORKERS", "1"))
+        uvicorn.run("server:app", host="0.0.0.0", port=8890, reload=False, workers=_workers)
     except KeyboardInterrupt:
         print("\n🛑 Сервер остановлен пользователем")
     except SystemExit:

@@ -10,8 +10,8 @@ from sqlalchemy import text
 from dotenv import load_dotenv
 
 # ====================== КОНФИГУРАЦИЯ ======================
-MODEL_A_ID = 31  # ← первая модель (A)
-MODEL_B_ID = 32  # ← вторая модель (B)
+MODEL_A_ID = 23  # ← первая модель (A)
+MODEL_B_ID = 31  # ← вторая модель (B)
 SERVICE_ID = 34  # ← id этой комплексной модели в vlad.version_microservice
 
 BEST_URL = "https://server.brain-project.online/best.php"
@@ -27,9 +27,13 @@ EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 def send_error_trace(exc: Exception):
     logs = f"Node: {NODE_NAME}\nException: {repr(exc)}\n\n{traceback.format_exc()}"
     try:
-        requests.post(TRACE_URL, data={"url": "fastapi_microservice", "node": NODE_NAME, "email": EMAIL, "logs": logs},
+        requests.post(TRACE_URL,
+                      data={"url": "fastapi_microservice",
+                            "node": NODE_NAME,
+                            "email": EMAIL,
+                            "logs": logs},
                       timeout=8)
-    except:
+    except Exception:
         pass
 
 # ── БД ────────────────────────────────────────────────────────────────────────
@@ -49,10 +53,25 @@ BRAIN_DATABASE_URL = f"mysql+aiomysql://{MASTER_USER}:{MASTER_PASSWORD}@{MASTER_
 engine_vlad = create_async_engine(DATABASE_URL, pool_size=10, echo=False)
 engine_brain = create_async_engine(BRAIN_DATABASE_URL, pool_size=6, echo=False)
 
+
+# ── Вспомогательная функция: загрузка весов у дочернего сервиса ───────────────
+def _fetch_weights_from_child(url: str, model_id: int) -> list[str]:
+    """
+    Синхронный запрос к /weights дочернего микросервиса.
+    Возвращает список строк-весов или поднимает исключение.
+    """
+    r = requests.get(f"{url}/weights", timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if "weights" not in data:
+        raise ValueError(f"Ответ модели {model_id} не содержит ключа 'weights'")
+    return data["weights"]
+
+
 # ── FastAPI ───────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Загружаем URL-ы из brain_service
+    # 1. Загружаем URL-ы из brain_service
     async with engine_brain.connect() as conn:
         res = await conn.execute(text("""
             SELECT id, url 
@@ -74,14 +93,12 @@ async def lifespan(app: FastAPI):
     print(f"   {MODEL_A_ID} → {app.state.URL_A}")
     print(f"   {MODEL_B_ID} → {app.state.URL_B}")
 
-    # Определяем, какие поля параметров существуют в таблицах сигналов
+    # 2. Определяем, какие поля параметров существуют в таблицах сигналов
     async with engine_brain.connect() as conn:
-        # Для модели A
         result_a = await conn.execute(text(f"DESCRIBE `brain_signal{MODEL_A_ID}`"))
         cols_a = [row[0] for row in result_a.fetchall() if row[0] in ('type', 'var', 'param')]
         app.state.cols_A = cols_a
 
-        # Для модели B
         result_b = await conn.execute(text(f"DESCRIBE `brain_signal{MODEL_B_ID}`"))
         cols_b = [row[0] for row in result_b.fetchall() if row[0] in ('type', 'var', 'param')]
         app.state.cols_B = cols_b
@@ -89,11 +106,51 @@ async def lifespan(app: FastAPI):
     print(f"✅ Поля сигналов модели {MODEL_A_ID}: {app.state.cols_A}")
     print(f"✅ Поля сигналов модели {MODEL_B_ID}: {app.state.cols_B}")
 
+    # 3. Загружаем флаги static из brain_models
+    async with engine_brain.connect() as conn:
+        res = await conn.execute(text("""
+            SELECT id, static
+            FROM brain_models
+            WHERE id IN (:a, :b)
+        """), {"a": MODEL_A_ID, "b": MODEL_B_ID})
+        static_flags = {row[0]: bool(row[1]) for row in res.fetchall()}
+
+    app.state.static_A = static_flags.get(MODEL_A_ID, True)
+    app.state.static_B = static_flags.get(MODEL_B_ID, True)
+
+    print(f"✅ Флаги static:")
+    print(f"   {MODEL_A_ID} → static={app.state.static_A}")
+    print(f"   {MODEL_B_ID} → static={app.state.static_B}")
+
+    # 4. Для нестатичных моделей загружаем веса при старте
+    #    Статичные модели не кешируют веса (запрашиваются «на лету» в /weights)
+    app.state.weights_A = None
+    app.state.weights_B = None
+
+    if not app.state.static_A:
+        try:
+            app.state.weights_A = _fetch_weights_from_child(app.state.URL_A, MODEL_A_ID)
+            print(f"✅ Предзагружены веса модели {MODEL_A_ID} "
+                  f"({len(app.state.weights_A)} шт.) — нестатичная модель")
+        except Exception as e:
+            print(f"⚠️ Не удалось предзагрузить веса модели {MODEL_A_ID}: {e}")
+            send_error_trace(e)
+
+    if not app.state.static_B:
+        try:
+            app.state.weights_B = _fetch_weights_from_child(app.state.URL_B, MODEL_B_ID)
+            print(f"✅ Предзагружены веса модели {MODEL_B_ID} "
+                  f"({len(app.state.weights_B)} шт.) — нестатичная модель")
+        except Exception as e:
+            print(f"⚠️ Не удалось предзагрузить веса модели {MODEL_B_ID}: {e}")
+            send_error_trace(e)
+
     yield
     await engine_vlad.dispose()
     await engine_brain.dispose()
 
 app = FastAPI(lifespan=lifespan)
+
 
 # ── Метаданные ────────────────────────────────────────────────────────────────
 @app.get("/")
@@ -114,24 +171,95 @@ async def get_metadata():
             str(MODEL_A_ID): app.state.URL_A,
             str(MODEL_B_ID): app.state.URL_B,
         },
+        "static": {
+            str(MODEL_A_ID): app.state.static_A,
+            str(MODEL_B_ID): app.state.static_B,
+        },
+        "weights_cached": {
+            str(MODEL_A_ID): app.state.weights_A is not None,
+            str(MODEL_B_ID): app.state.weights_B is not None,
+        },
         "params": {
             "pair": "1=EURUSD, 3=BTC, 4=ETH",
             "day": "1=daily, 0=hourly",
             "params_format": f"{{ {MODEL_A_ID}: {{type, var, k}}, {MODEL_B_ID}: {{type, var, k}} }}"
+        },
+        "metadata": {
+            "child_models": [MODEL_A_ID, MODEL_B_ID],
+            "static_flags": {
+                str(MODEL_A_ID): app.state.static_A,
+                str(MODEL_B_ID): app.state.static_B,
+            },
+            "weights_cached": {
+                str(MODEL_A_ID): app.state.weights_A is not None,
+                str(MODEL_B_ID): app.state.weights_B is not None,
+            }
         }
     }
+
 
 # ── Weights ───────────────────────────────────────────────────────────────────
 @app.get("/weights")
 async def get_weights():
     try:
-        w_a = requests.get(f"{app.state.URL_A}/weights").json()["weights"]
-        w_b = requests.get(f"{app.state.URL_B}/weights").json()["weights"]
+        # Модель A
+        if not app.state.static_A and app.state.weights_A is not None:
+            w_a = app.state.weights_A
+        else:
+            w_a = _fetch_weights_from_child(app.state.URL_A, MODEL_A_ID)
+
+        # Модель B
+        if not app.state.static_B and app.state.weights_B is not None:
+            w_b = app.state.weights_B
+        else:
+            w_b = _fetch_weights_from_child(app.state.URL_B, MODEL_B_ID)
+
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Child service unreachable: {e}")
 
-    combined = [f"{MODEL_A_ID}_" + w for w in w_a] + [f"{MODEL_B_ID}_" + w for w in w_b]
-    return {"weights": list(set(combined)), "total": len(combined)}
+    combined = (
+        [f"{MODEL_A_ID}_" + w for w in w_a]
+        + [f"{MODEL_B_ID}_" + w for w in w_b]
+    )
+    # list(set(...)) убирает дубли, но теряет порядок — сохраняем порядок через dict
+    seen = {}
+    for w in combined:
+        seen[w] = True
+    deduped = list(seen.keys())
+
+    return {"weights": deduped, "total": len(deduped)}
+
+@app.get("/new_weights")
+async def new_weights():
+    all_weights: list[str] = []
+
+    for model_id, url, is_static, attr in [
+        (MODEL_A_ID, app.state.URL_A, app.state.static_A, "weights_A"),
+        (MODEL_B_ID, app.state.URL_B, app.state.static_B, "weights_B"),
+    ]:
+        if is_static:
+            try:
+                weights = _fetch_weights_from_child(url, model_id)
+            except Exception as e:
+                send_error_trace(e)
+                weights = []
+        else:
+            try:
+                weights = _fetch_weights_from_child(url, model_id)
+                setattr(app.state, attr, weights)
+            except Exception as e:
+                send_error_trace(e)
+                weights = getattr(app.state, attr) or []
+
+        all_weights += [f"{model_id}_" + w for w in weights]
+
+    # Дедупликация с сохранением порядка
+    seen: dict[str, bool] = {}
+    for w in all_weights:
+        seen[w] = True
+
+    return {"weights": list(seen.keys())}
+
 
 # ── Values ────────────────────────────────────────────────────────────────────
 @app.get("/values")
@@ -143,7 +271,7 @@ async def get_values(
 ):
     try:
         param_dict = json.loads(params)
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON in params")
 
     combined = {}
@@ -153,7 +281,6 @@ async def get_values(
         if k is None:
             raise HTTPException(status_code=400, detail="Missing k in params")
 
-        # Определяем URL нужной модели
         if model_id == MODEL_A_ID:
             url = app.state.URL_A
         elif model_id == MODEL_B_ID:
@@ -161,7 +288,6 @@ async def get_values(
         else:
             continue  # неизвестная модель – пропускаем
 
-        # Готовим параметры для запроса к дочернему микросервису (все кроме k)
         query_params = {key: val for key, val in subp.items() if key != 'k'}
         query_params.update({'pair': pair, 'day': day, 'date': date})
 
@@ -177,6 +303,7 @@ async def get_values(
 
     return combined
 
+
 # ── Params ────────────────────────────────────────────────────────────────────
 @app.get("/params")
 async def get_params(
@@ -186,7 +313,6 @@ async def get_params(
 ):
     max_per_model = 4 if tier == 0 else 3
 
-    # Получаем ранжированные списки сигналов от best.php
     try:
         best_a = requests.get(f"{BEST_URL}?neuronet_id={MODEL_A_ID}&pair={pair}&day={day}").json()
         best_b = requests.get(f"{BEST_URL}?neuronet_id={MODEL_B_ID}&pair={pair}&day={day}").json()
@@ -199,34 +325,28 @@ async def get_params(
     TABLE_A = f"brain_signal{MODEL_A_ID}"
     TABLE_B = f"brain_signal{MODEL_B_ID}"
 
-    # Загружаем параметры сигналов из БД, используя только существующие поля
     params_a = []
     params_b = []
 
     async with engine_brain.connect() as conn:
-        # Для модели A
         for sid in sorted_a:
             if len(params_a) >= max_per_model:
                 break
-            # Динамическое построение SELECT на основе сохранённых полей
             if app.state.cols_A:
                 cols_str = ", ".join(app.state.cols_A)
                 query = text(f"SELECT {cols_str} FROM `{TABLE_A}` WHERE id = :sid AND tier = :tier AND is_day = :day")
                 res = await conn.execute(query, {"sid": sid, "tier": tier, "day": day})
                 row = res.fetchone()
                 if row:
-                    # Строим объект параметров, добавляя только существующие поля
                     param_obj = {}
                     for idx, col in enumerate(app.state.cols_A):
                         value = row[idx]
                         if col == 'param' and value is not None:
-                            # Оборачиваем param в список, как в примере
                             param_obj[col] = [value]
                         else:
                             param_obj[col] = value
                     params_a.append(param_obj)
 
-        # Для модели B
         for sid in sorted_b:
             if len(params_b) >= max_per_model:
                 break
@@ -245,10 +365,8 @@ async def get_params(
                             param_obj[col] = value
                     params_b.append(param_obj)
 
-    # Генерация комбинаций
     combs = []
     if tier == 0:
-        # Фиксированный коэффициент 0.5 для обоих
         for pa in params_a:
             for pb in params_b:
                 combs.append({
@@ -256,7 +374,6 @@ async def get_params(
                     str(MODEL_B_ID): {**pb, "k": 0.5}
                 })
     else:
-        # Плавающий коэффициент с шагом 0.1
         for pa in params_a:
             for pb in params_b:
                 for ki in range(1, 10):
@@ -267,6 +384,7 @@ async def get_params(
                     })
 
     return combs[:150]
+
 
 # ── Patch ─────────────────────────────────────────────────────────────────────
 @app.post("/patch")
@@ -284,6 +402,8 @@ async def patch_service():
                 {"v": new, "id": SERVICE_ID})
     return {"status": "ok", "version": new}
 
+
 # ── Запуск ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=8897, reload=False, workers=1)
+    _workers = int(os.getenv("WORKERS", "1"))
+    uvicorn.run("server:app", host="0.0.0.0", port=8897, reload=False, workers=_workers)
