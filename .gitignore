@@ -7,6 +7,8 @@ desktop.ini
 # Редакторы
 .vscode/
 .idea/
+.pytest_cache
+__pycache__
 
 # Логи
 *.log
