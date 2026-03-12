@@ -70,17 +70,69 @@ def err_response(
     return {"status": "error", "error": message, "payload": {}}
 
 
+# ── Engine builder ────────────────────────────────────────────────────────────
+def build_engines():
+    """
+    Создаёт три AsyncEngine из переменных окружения:
+      - engine_vlad  : локальная БД сервиса  (DB_*)
+      - engine_brain : мастер-нода проекта   (MASTER_*)
+      - engine_super : супер-нода (таблицы brain_service и т.п.) (SUPER_*)
+
+    Возвращает (engine_vlad, engine_brain, engine_super).
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    def _url(host, port, user, password, name):
+        return f"mysql+aiomysql://{user}:{password}@{host}:{port}/{name}"
+
+    engine_vlad = create_async_engine(
+        _url(
+            os.getenv("DB_HOST",     ""),
+            os.getenv("DB_PORT",     "3306"),
+            os.getenv("DB_USER",     ""),
+            os.getenv("DB_PASSWORD", ""),
+            os.getenv("DB_NAME",     ""),
+        ),
+        pool_size=10, echo=False,
+    )
+
+    engine_brain = create_async_engine(
+        _url(
+            os.getenv("MASTER_HOST",     ""),
+            os.getenv("MASTER_PORT",     "3306"),
+            os.getenv("MASTER_USER",     ""),
+            os.getenv("MASTER_PASSWORD", ""),
+            os.getenv("MASTER_NAME",     "brain"),
+        ),
+        pool_size=5, echo=False,
+    )
+
+    engine_super = create_async_engine(
+        _url(
+            os.getenv("SUPER_HOST",     ""),
+            os.getenv("SUPER_PORT",     "3306"),
+            os.getenv("SUPER_USER",     ""),
+            os.getenv("SUPER_PASSWORD", ""),
+            os.getenv("SUPER_NAME",     "brain"),
+        ),
+        pool_size=3, echo=False,
+    )
+
+    return engine_vlad, engine_brain, engine_super
+
+
 # ── Workers ───────────────────────────────────────────────────────────────────
-async def resolve_workers(engine_brain, service_id: int, default: int = 1) -> int:
+async def resolve_workers(engine_super, service_id: int, default: int = 1) -> int:
     """
     DEV  → всегда 1.
-    PROD → читает brain_service.workers; если =0, использует brain_models.priority.
+    PROD → читает brain_service.workers из engine_super;
+           если =0, использует brain_models.priority.
     """
     if IS_DEV:
         return 1
     try:
         from sqlalchemy import text
-        async with engine_brain.connect() as conn:
+        async with engine_super.connect() as conn:
             res = await conn.execute(
                 text("SELECT workers FROM brain_service WHERE id = :sid"),
                 {"sid": service_id},

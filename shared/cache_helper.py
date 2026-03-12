@@ -15,7 +15,7 @@ cache_helper.py — кеш /values для всех brain-* микросерви�
 
   2. В preload_all_data() — добавить в конец:
        global SERVICE_URL
-       SERVICE_URL = await load_service_url(engine_brain, SERVICE_ID)
+       SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
        await ensure_cache_table(engine_vlad)
 
   3. В @app.get("/values") — заменить тело на cached_values(...)
@@ -74,12 +74,13 @@ async def ensure_cache_table(engine_vlad: AsyncEngine) -> None:
     log.info("✅ vlad_values_cache — готова")
 
 
-async def load_service_url(engine_brain: AsyncEngine, service_id: int) -> str:
+async def load_service_url(engine_super: AsyncEngine, service_id: int) -> str:
     """
     Читает URL сервиса из brain_service по service_id.
+    Использует engine_super — супер-нода где гарантированно живёт brain_service.
     Бросает RuntimeError если не найдено.
     """
-    async with engine_brain.connect() as conn:
+    async with engine_super.connect() as conn:
         row = (await conn.execute(
             text("SELECT url FROM brain_service WHERE id = :sid"),
             {"sid": service_id},
@@ -173,7 +174,6 @@ async def cached_values(
 
     # ── 3. SELECT снова — защита от гонки 0.1 сек ────────────────────────────
     # Пока мы считали, параллельный поток мог уже записать тот же результат.
-    # Не пишем в базу одно и то же дважды.
     if result:
         already = await _cache_get(engine_vlad, service_url, pair, day, date_val, p_hash)
         if already is None:

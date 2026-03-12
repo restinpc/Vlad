@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Query
-from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import text
 from dotenv import load_dotenv
 
@@ -16,7 +15,7 @@ from common import (
     MODE, IS_DEV,
     log, send_error_trace,
     ok_response, err_response,
-    resolve_workers,
+    resolve_workers, build_engines,
 )
 from cache_helper import ensure_cache_table, load_service_url, cached_values
 
@@ -28,26 +27,12 @@ PORT       = 8888
 # ── Конфигурация БД ───────────────────────────────────────────────────────────
 load_dotenv()
 
-DB_HOST         = os.getenv("DB_HOST",         "")
-DB_PORT         = os.getenv("DB_PORT",         "")
-DB_USER         = os.getenv("DB_USER",         "")
-DB_PASSWORD     = os.getenv("DB_PASSWORD",     "")
-DB_NAME         = os.getenv("DB_NAME",         "")
-MASTER_HOST     = os.getenv("MASTER_HOST",     "")
-MASTER_PORT     = os.getenv("MASTER_PORT",     "")
-MASTER_USER     = os.getenv("MASTER_USER",     "")
-MASTER_PASSWORD = os.getenv("MASTER_PASSWORD", "")
-MASTER_NAME     = os.getenv("MASTER_NAME",     "")
-
-DATABASE_URL_VLAD  = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-DATABASE_URL_BRAIN = f"mysql+aiomysql://{MASTER_USER}:{MASTER_PASSWORD}@{MASTER_HOST}:{MASTER_PORT}/{MASTER_NAME}"
-
-engine_vlad  = create_async_engine(DATABASE_URL_VLAD,  pool_size=10, echo=False)
-engine_brain = create_async_engine(DATABASE_URL_BRAIN, pool_size=5,  echo=False)
+engine_vlad, engine_brain, engine_super = build_engines()
 
 log(f"MODE={MODE}", NODE_NAME, force=True)
-log(f"vlad:  {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}",              NODE_NAME)
-log(f"brain: {MASTER_USER}@{MASTER_HOST}:{MASTER_PORT}/{MASTER_NAME}", NODE_NAME)
+log(f"vlad:  {os.getenv('DB_USER')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}",           NODE_NAME)
+log(f"brain: {os.getenv('MASTER_USER')}@{os.getenv('MASTER_HOST')}:{os.getenv('MASTER_PORT')}/{os.getenv('MASTER_NAME')}", NODE_NAME)
+log(f"super: {os.getenv('SUPER_USER')}@{os.getenv('SUPER_HOST')}:{os.getenv('SUPER_PORT')}/{os.getenv('SUPER_NAME')}",     NODE_NAME)
 
 # ── Глобальные данные ─────────────────────────────────────────────────────────
 GLOBAL_EXTREMUMS    = {}
@@ -172,8 +157,8 @@ async def preload_all_data():
             except Exception as e:
                 send_error_trace(e, NODE_NAME, f"preload_rates_{table}"); raise
 
-    # ── Загружаем URL сервиса и создаём таблицу кеша ──────────────────────────
-    SERVICE_URL = await load_service_url(engine_brain, SERVICE_ID)
+    # ── Загружаем URL сервиса через супер-ноду и создаём таблицу кеша ─────────
+    SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
     await ensure_cache_table(engine_vlad)
 
     log("SERVER READY. ALL DATA PRELOADED.", NODE_NAME, force=True)
@@ -199,6 +184,7 @@ async def lifespan(app: FastAPI):
     task.cancel()
     await engine_vlad.dispose()
     await engine_brain.dispose()
+    await engine_super.dispose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -387,7 +373,7 @@ async def patch_service():
 if __name__ == "__main__":
     import asyncio as _asyncio
     async def _get_workers():
-        return await resolve_workers(engine_brain, SERVICE_ID, default=4)
+        return await resolve_workers(engine_super, SERVICE_ID, default=4)
     _workers = _asyncio.run(_get_workers())
     log(f"Starting with {_workers} worker(s) in {MODE} mode", NODE_NAME, force=True)
     try:
