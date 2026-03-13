@@ -367,17 +367,22 @@ async def get_new_weights(code: str = Query(...)):
             hour = int(parts[5]) if len(parts) > 5 else None
         except ValueError:
             return err_response("mode/hour must be integers")
+        hour_val = hour if hour is not None else -999999
         async with engine_vlad.connect() as conn:
             res = await conn.execute(text("""
                 SELECT weight_code FROM vlad_investing_weights
-                WHERE (event_id, forecast_direction, surprise_direction, actual_direction,
-                       mode, COALESCE(hour, -999999))
-                       > (:event_id, :fdir, :sdir, :adir, :mode, :hour)
+                WHERE
+                    event_id > :event_id
+                    OR (event_id = :event_id AND forecast_direction > :fdir)
+                    OR (event_id = :event_id AND forecast_direction = :fdir AND surprise_direction > :sdir)
+                    OR (event_id = :event_id AND forecast_direction = :fdir AND surprise_direction = :sdir AND actual_direction > :adir)
+                    OR (event_id = :event_id AND forecast_direction = :fdir AND surprise_direction = :sdir AND actual_direction = :adir AND mode > :mode)
+                    OR (event_id = :event_id AND forecast_direction = :fdir AND surprise_direction = :sdir AND actual_direction = :adir AND mode = :mode AND COALESCE(hour, -999999) > :hour)
                 ORDER BY event_id, forecast_direction, surprise_direction, actual_direction,
                          mode, hour IS NULL, hour
             """), {
                 "event_id": event_id, "fdir": fdir, "sdir": sdir, "adir": adir,
-                "mode": mode, "hour": hour if hour is not None else -999999,
+                "mode": mode, "hour": hour_val,
             })
         return ok_response([r["weight_code"] for r in res.mappings().all()])
     except Exception as e:

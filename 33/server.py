@@ -400,19 +400,25 @@ async def get_new_weights(code: str = Query(...)):
             hour_shift = int(parts[7]) if len(parts) > 7 else None
         except ValueError:
             return err_response("mode/hour_shift must be integers")
+        hs_val = hour_shift if hour_shift is not None else -999999
         async with engine_vlad.connect() as conn:
             res = await conn.execute(text("""
                 SELECT weight_code FROM brain_calendar_weights
-                WHERE (event_id, currency, imp_c, fcd_c, scd_c, rcd_c,
-                       mode, COALESCE(hour_shift, -999999))
-                       > (:event_id, :currency, :imp_c, :fcd_c, :scd_c, :rcd_c, :mode, :hour_shift)
+                WHERE
+                    event_id > :event_id
+                    OR (event_id = :event_id AND currency > :currency)
+                    OR (event_id = :event_id AND currency = :currency AND imp_c > :imp_c)
+                    OR (event_id = :event_id AND currency = :currency AND imp_c = :imp_c AND fcd_c > :fcd_c)
+                    OR (event_id = :event_id AND currency = :currency AND imp_c = :imp_c AND fcd_c = :fcd_c AND scd_c > :scd_c)
+                    OR (event_id = :event_id AND currency = :currency AND imp_c = :imp_c AND fcd_c = :fcd_c AND scd_c = :scd_c AND rcd_c > :rcd_c)
+                    OR (event_id = :event_id AND currency = :currency AND imp_c = :imp_c AND fcd_c = :fcd_c AND scd_c = :scd_c AND rcd_c = :rcd_c AND mode > :mode)
+                    OR (event_id = :event_id AND currency = :currency AND imp_c = :imp_c AND fcd_c = :fcd_c AND scd_c = :scd_c AND rcd_c = :rcd_c AND mode = :mode AND COALESCE(hour_shift, -999999) > :hs)
                 ORDER BY event_id, currency, imp_c, fcd_c, scd_c, rcd_c, mode,
                          hour_shift IS NULL, hour_shift
             """), {
                 "event_id": event_id, "currency": currency,
                 "imp_c": imp_c, "fcd_c": fcd_c, "scd_c": scd_c, "rcd_c": rcd_c,
-                "mode": mode,
-                "hour_shift": hour_shift if hour_shift is not None else -999999,
+                "mode": mode, "hs": hs_val,
             })
         return ok_response([r["weight_code"] for r in res.mappings().all()])
     except Exception as e:
