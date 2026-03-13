@@ -58,7 +58,7 @@ def get_modification_factor(pair_id):
     return {1: 0.001, 3: 1000.0, 4: 100.0}.get(pair_id, 1.0)
 
 def parse_date_string(date_str):
-    for fmt in ("%Y-%d-%m %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%d-%m %H:%M:%S"):
         try:
             return datetime.strptime(date_str.strip(), fmt)
         except ValueError:
@@ -348,7 +348,8 @@ async def get_weights():
     try:
         return ok_response(GLOBAL_WEIGHT_CODES)
     except Exception as e:
-        return err_response(str(e), exc=e, node=NODE_NAME, script="get_weights")
+        send_error_trace(e, node=NODE_NAME, script="get_weights")
+        return err_response(str(e))
 
 
 @app.get("/new_weights")
@@ -376,17 +377,18 @@ async def get_new_weights(code: str = Query(...)):
                     OR (event_id = :event_id AND forecast_direction > :fdir)
                     OR (event_id = :event_id AND forecast_direction = :fdir AND surprise_direction > :sdir)
                     OR (event_id = :event_id AND forecast_direction = :fdir AND surprise_direction = :sdir AND actual_direction > :adir)
-                    OR (event_id = :event_id AND forecast_direction = :fdir AND surprise_direction = :sdir AND actual_direction = :adir AND mode > :mode)
-                    OR (event_id = :event_id AND forecast_direction = :fdir AND surprise_direction = :sdir AND actual_direction = :adir AND mode = :mode AND COALESCE(hour, -999999) > :hour)
+                    OR (event_id = :event_id AND forecast_direction = :fdir AND surprise_direction = :sdir AND actual_direction = :adir AND `mode_val` > :mode)
+                    OR (event_id = :event_id AND forecast_direction = :fdir AND surprise_direction = :sdir AND actual_direction = :adir AND `mode_val` = :mode AND COALESCE(hour_shift, -999999) > :hour)
                 ORDER BY event_id, forecast_direction, surprise_direction, actual_direction,
-                         mode, hour IS NULL, hour
+                         `mode_val`, hour_shift IS NULL, hour_shift
             """), {
                 "event_id": event_id, "fdir": fdir, "sdir": sdir, "adir": adir,
                 "mode": mode, "hour": hour_val,
             })
         return ok_response([r["weight_code"] for r in res.mappings().all()])
     except Exception as e:
-        return err_response(str(e), exc=e, node=NODE_NAME, script="get_new_weights")
+        send_error_trace(e, node=NODE_NAME, script="get_new_weights")
+        return err_response(str(e))
 
 
 @app.get("/values")
@@ -407,7 +409,8 @@ async def get_values(
             node         = NODE_NAME,
         )
     except Exception as e:
-        return err_response(str(e), exc=e, node=NODE_NAME, script="get_values")
+        send_error_trace(e, node=NODE_NAME, script="get_values")
+        return err_response(str(e))
 
 
 @app.post("/patch")

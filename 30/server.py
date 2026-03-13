@@ -67,7 +67,7 @@ def get_modification_factor(pair_id):
     return {1: 0.001, 3: 1000.0, 4: 100.0}.get(pair_id, 1.0)
 
 def parse_date_string(date_str):
-    for fmt in ("%Y-%d-%m %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%d-%m %H:%M:%S"):
         try:
             return datetime.strptime(date_str.strip(), fmt)
         except ValueError:
@@ -361,7 +361,8 @@ async def get_weights():
     try:
         return ok_response(GLOBAL_WEIGHT_CODES)
     except Exception as e:
-        return err_response(str(e), exc=e, node=NODE_NAME, script="get_weights")
+        send_error_trace(e, node=NODE_NAME, script="get_weights")
+        return err_response(str(e))
 
 
 @app.get("/values")
@@ -382,7 +383,8 @@ async def get_values(
             node         = NODE_NAME,
         )
     except Exception as e:
-        return err_response(str(e), exc=e, node=NODE_NAME, script="get_values")
+        send_error_trace(e, node=NODE_NAME, script="get_values")
+        return err_response(str(e))
 
 
 @app.post("/patch")

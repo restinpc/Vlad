@@ -6,6 +6,7 @@ Usage:
 """
 
 import os
+import threading
 import traceback
 import requests
 
@@ -20,20 +21,34 @@ EMAIL     = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
 
 def send_error_trace(exc: Exception, node: str, script: str = "server.py") -> None:
+    """
+    Отправляет трассировку ошибки АСИНХРОННО в отдельном потоке,
+    чтобы НЕ блокировать asyncio event loop.
+
+    ВАЖНО: раньше здесь был синхронный requests.post(timeout=10), который
+    полностью блокировал event loop на 10 секунд → каскадное исчерпание
+    пула соединений. Теперь отправка идёт в daemon-потоке.
+    """
     logs = (
         f"Node: {node}\nScript: {script}\n"
         f"Exception: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
     )
-    try:
-        log(f"📤 Sending error trace to {TRACE_URL}", node, force=True)
-        r = requests.post(
-            TRACE_URL,
-            data={"url": "fastapi_microservice", "node": node, "email": EMAIL, "logs": logs},
-            timeout=10,
-        )
-        log(f"✅ Trace sent, status={r.status_code}", node, force=True)
-    except Exception as e:
-        log(f"⚠️  Failed to send trace: {e}", node, force=True)
+
+    def _send() -> None:
+        try:
+            log(f"📤 Sending error trace to {TRACE_URL}", node, force=True)
+            r = requests.post(
+                TRACE_URL,
+                data={"url": "fastapi_microservice", "node": node,
+                      "email": EMAIL, "logs": logs},
+                timeout=10,
+            )
+            log(f"✅ Trace sent, status={r.status_code}", node, force=True)
+        except Exception as e:
+            log(f"⚠️  Failed to send trace: {e}", node, force=True)
+
+    # daemon=True — поток умрёт вместе с процессом, не задержит shutdown
+    threading.Thread(target=_send, daemon=True).start()
 
 
 # ── Логирование ───────────────────────────────────────────────────────────────
@@ -62,11 +77,11 @@ def err_response(
     """
     {"status": "error", "error": message, "payLoad": {}}
 
-    Если передан exc — отправляет трассировку и перебрасывает исключение,
-    чтобы FastAPI вернул 500.
+    Если передан exc — отправляет трассировку (в фоновом потоке!) и
+    перебрасывает исключение, чтобы FastAPI вернул 500.
     """
     if exc is not None:
-        send_error_trace(exc, node=node, script=script)
+        send_error_trace(exc, node=node, script=script)  # теперь неблокирующий
         raise exc
     return {"status": "error", "error": message, "payLoad": {}}
 
@@ -80,6 +95,11 @@ def build_engines():
       - engine_super : супер-нода (таблицы brain_service и т.п.) (SUPER_*)
 
     Возвращает (engine_vlad, engine_brain, engine_super).
+
+    pool_pre_ping=True — SQLAlchemy проверяет соединение перед использованием,
+    автоматически переподключается при "stale" коннекте (например, после
+    простоя или рестарта MySQL). Предотвращает ошибки типа
+    "Lost connection to MySQL server".
     """
     from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -94,7 +114,11 @@ def build_engines():
             os.getenv("DB_PASSWORD", ""),
             os.getenv("DB_NAME",     ""),
         ),
-        pool_size=20, echo=False,
+        pool_size=20,
+        max_overflow=20,    # было дефолтные 10 → увеличено, чтобы выдержать всплески
+        pool_pre_ping=True, # автопереподключение при stale-соединениях
+        pool_recycle=1800,  # переиспользовать соединения не дольше 30 мин
+        echo=False,
     )
 
     engine_brain = create_async_engine(
@@ -105,7 +129,11 @@ def build_engines():
             os.getenv("MASTER_PASSWORD", ""),
             os.getenv("MASTER_NAME",     "brain"),
         ),
-        pool_size=5, echo=False,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        echo=False,
     )
 
     engine_super = create_async_engine(
@@ -116,7 +144,11 @@ def build_engines():
             os.getenv("SUPER_PASSWORD", ""),
             os.getenv("SUPER_NAME",     "brain"),
         ),
-        pool_size=3, echo=False,
+        pool_size=3,
+        max_overflow=5,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        echo=False,
     )
 
     return engine_vlad, engine_brain, engine_super

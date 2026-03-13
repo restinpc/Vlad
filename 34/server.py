@@ -203,8 +203,8 @@ async def get_weights():
             else _fetch_weights_from_child(app.state.URL_B, MODEL_B_ID)
         )
     except Exception as e:
-        return err_response(f"Child service unreachable: {e}", exc=e,
-                            node=NODE_NAME, script="get_weights")
+        send_error_trace(e, node=NODE_NAME, script="get_weights")
+        return err_response(f"Child service unreachable: {e}")
     combined = [f"{MODEL_A_ID}_" + w for w in w_a] + [f"{MODEL_B_ID}_" + w for w in w_b]
     deduped  = list(dict.fromkeys(combined))
     return ok_response(deduped)
@@ -229,7 +229,8 @@ async def new_weights():
         deduped = list(dict.fromkeys(all_weights))
         return ok_response(deduped)
     except Exception as e:
-        return err_response(str(e), exc=e, node=NODE_NAME, script="new_weights")
+        send_error_trace(e, node=NODE_NAME, script="new_weights")
+        return err_response(str(e))
 
 
 @app.get("/values")
@@ -257,7 +258,8 @@ async def get_values(
             node         = NODE_NAME,
         )
     except Exception as e:
-        return err_response(str(e), exc=e, node=NODE_NAME, script="get_values")
+        send_error_trace(e, node=NODE_NAME, script="get_values")
+        return err_response(str(e))
 
 
 @app.get("/params")
