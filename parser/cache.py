@@ -38,7 +38,7 @@ ALERT_EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
 def send_trace(subject: str, body: str, is_error: bool = False) -> None:
     """Отправляет трассировку на почту. Не бросает исключений."""
-    level = "ERROR" if is_error else "INFO"
+    level    = "ERROR" if is_error else "INFO"
     full_body = f"[{level}] {subject}\n\nNode: {NODE_NAME}\n\n{body}"
     try:
         requests.post(
@@ -260,18 +260,6 @@ def _parse_dt(s: str) -> datetime:
     raise ValueError(f"Неверный формат даты: {s!r}")
 
 
-def _print_progress(done: int, total: int, label: str,
-                    errors: int = 0, skipped: int = 0) -> None:
-    pct   = done / total * 100 if total else 0
-    extra = ""
-    if skipped:
-        extra += f"  skip={skipped}"
-    if errors:
-        extra += f"  err={errors}"
-    print(f"\r    {label} [{done}/{total}] {pct:.1f}%{extra}",
-          end="", flush=True)
-
-
 def _compute_signal(values: dict, tier: int) -> int:
     if not values:
         return 0
@@ -289,6 +277,10 @@ def _compute_signal(values: dict, tier: int) -> int:
 
 async def _call_values(session: aiohttp.ClientSession,
                        url: str, params: dict) -> dict | None:
+    """
+    Возвращает dict с данными (может быть пустым {}), либо None при ошибке.
+    None означает ошибку: нет соединения, HTTP != 200 или неожиданный формат.
+    """
     try:
         async with session.get(
             f"{url}/values",
@@ -296,14 +288,30 @@ async def _call_values(session: aiohttp.ClientSession,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
             if r.status != 200:
+                log.debug(f"_call_values HTTP {r.status} ← {url}/values params={params}")
                 return None
             data = await r.json()
+            # BUG FIX 1: обрабатываем обёртку {"status": "ok", "payLoad": {...}}
             if "payLoad" in data:
-                return data["payLoad"]
+                payload = data["payLoad"]
+                # BUG FIX 2: payLoad может быть null → возвращаем пустой dict, не None
+                if payload is None:
+                    return {}
+                if isinstance(payload, dict):
+                    return payload
+                log.debug(f"_call_values: payLoad неожиданного типа {type(payload)}")
+                return None
+            # Ответ без обёртки — прямой dict
             if "status" not in data:
                 return data
+            # {"status": "error", ...} без payLoad
+            log.debug(f"_call_values: ошибка от сервера: {data.get('error', data)}")
             return None
-    except Exception:
+    except asyncio.TimeoutError:
+        log.debug(f"_call_values: таймаут ← {url}/values params={params}")
+        return None
+    except Exception as e:
+        log.debug(f"_call_values: исключение {type(e).__name__}: {e} ← {url}/values")
         return None
 
 
@@ -337,12 +345,12 @@ async def fill_cache(engine_vlad, candles: list[dict],
                      extra_params: dict,
                      deadline: Deadline) -> dict:
     if not candles:
-        return {"done": 0, "total": 0, "errors": 0, "skipped": 0}
+        return {"total": 0, "new": 0, "errors": 0, "skipped": 0}
 
     p_hash = _params_hash(extra_params)
     total  = len(candles)
-    done   = errors = skipped = 0
 
+    # Загружаем уже закешированные даты
     async with engine_vlad.connect() as conn:
         res = await conn.execute(text("""
             SELECT date_val FROM vlad_values_cache
@@ -352,30 +360,27 @@ async def fill_cache(engine_vlad, candles: list[dict],
         cached_dates = {row[0] for row in res.fetchall()}
 
     skipped = sum(1 for c in candles if c["date"] in cached_dates)
+    errors  = 0
+    new     = 0  # BUG FIX 3: считаем реально вставленные записи, а не расчётное значение
 
     async with aiohttp.ClientSession() as session:
-        for candle in candles:
+        for i, candle in enumerate(candles):
             if deadline.exceeded():
                 log.warning(f"\n  ⏰ Таймаут! Осталось обработать "
-                            f"{total - done} свечей этой комбинации")
+                            f"{total - i} свечей этой комбинации")
                 break
 
             date_val = candle["date"]
 
             if date_val in cached_dates:
-                done += 1
-                _print_progress(done, total, "cache", errors, skipped)
                 continue
 
             date_str    = date_val.strftime("%Y-%m-%d %H:%M:%S")
-            call_params = {"pair": pair, "day": day,
-                           "date": date_str, **extra_params}
+            call_params = {"pair": pair, "day": day, "date": date_str, **extra_params}
             result = await _call_values(session, service_url, call_params)
 
             if result is None:
                 errors += 1
-                done   += 1
-                _print_progress(done, total, "cache", errors, skipped)
                 continue
 
             try:
@@ -391,14 +396,11 @@ async def fill_cache(engine_vlad, candles: list[dict],
                         "pj":   json.dumps(extra_params, ensure_ascii=False),
                         "rj":   json.dumps(result,       ensure_ascii=False),
                     })
-            except Exception:
-                pass
+                    new += 1
+            except Exception as e:
+                log.debug(f"  fill_cache INSERT error: {e}")
 
-            done += 1
-            _print_progress(done, total, "cache", errors, skipped)
-
-    print()
-    return {"done": done, "total": total, "errors": errors, "skipped": skipped}
+    return {"total": total, "new": new, "errors": errors, "skipped": skipped}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -454,11 +456,8 @@ async def run_backtest(engine_vlad, candles: list[dict],
     highest      = INITIAL_BALANCE
     summary_lost = 0.0
     trade_count  = win_count = 0
-    total        = len(candles)
 
-    for i, candle in enumerate(candles):
-        _print_progress(i + 1, total, f"backtest tier={tier}")
-
+    for candle in candles:
         values = cache_map.get(candle["date"])
         if not values:
             continue
@@ -481,8 +480,6 @@ async def run_backtest(engine_vlad, candles: list[dict],
         drawdown = highest - balance
         if drawdown > 0:
             summary_lost += drawdown / highest
-
-    print()
 
     if trade_count < 10:
         return {"error": "not enough trades", "trade_count": trade_count}
@@ -650,10 +647,11 @@ async def run(args) -> None:
     engine_vlad  = create_async_engine(vlad_url,  pool_size=10, echo=False)
     engine_brain = create_async_engine(brain_url, pool_size=6,  echo=False)
 
-    # Общая статистика по всем моделям
-    stats_cache    = {"new": 0, "skipped": 0, "errors": 0}
-    stats_backtest = {"done": 0, "skipped": 0, "failed": 0}
-    timed_out      = False
+    # Глобальная статистика по всем моделям
+    # BUG FIX 4: разделяем глобальные счётчики (итого) и локальные (per-tier)
+    global_cache    = {"new": 0, "skipped": 0, "errors": 0}
+    global_backtest = {"done": 0, "skipped": 0, "failed": 0}
+    timed_out       = False
 
     try:
         async with engine_vlad.begin() as conn:
@@ -677,7 +675,6 @@ async def run(args) -> None:
 
             log.info(f"\n{'='*60}\n🚀 Обработка модели {model_id}\n{'='*60}")
 
-            # Получаем конфигурацию для текущей модели (синхронно)
             try:
                 sync_engine = create_engine(
                     super_sync_url, pool_recycle=3600,
@@ -689,12 +686,11 @@ async def run(args) -> None:
             except Exception as e:
                 log.error(f"❌ Не удалось получить конфигурацию для модели {model_id}: {e}")
                 send_error_trace(e, f"get_service_config model={model_id}")
-                continue   # переходим к следующей модели
+                continue
 
             log.info(f"  URL модели {model_id}: {service_url}")
             log.info(f"  Комбинаций параметров: {len(param_combos)}")
 
-            # ── Далее идёт исходный код для одной модели (с заменой MODEL_ID на model_id) ──
             for pair in args.pairs:
                 for day in args.days:
 
@@ -704,7 +700,7 @@ async def run(args) -> None:
 
                     log.info(
                         f"\n{'='*55}\n"
-                        f"  pair={pair} ({PAIR_NAMES.get(pair)})  "
+                        f"pair={pair} ({PAIR_NAMES.get(pair)}) "
                         f"day={day} ({DAY_NAMES.get(day)})  "
                         f"[осталось: {deadline.remaining_str()}]"
                     )
@@ -715,29 +711,33 @@ async def run(args) -> None:
                     if not candles:
                         log.warning("  ⚠️  Нет свечей — пропускаем")
                         continue
-                    log.info(f"  Свечей: {len(candles)}")
+                    log.info(f"Свечей: {len(candles)}")
 
                     # ── Шаг 1: Кеш ────────────────────────────────────────────
                     if not args.skip_fill:
-                        log.info(f"\n  📥 Кеш ({len(param_combos)} комбинаций)...")
+                        log.info(f"\n📥 Кеш ({len(param_combos)} комбинаций)...")
+                        # BUG FIX 5: локальные счётчики кеша для текущей пары/дня
+                        pair_cache = {"new": 0, "skipped": 0, "errors": 0}
                         for idx, combo in enumerate(param_combos, 1):
                             if deadline.exceeded():
                                 timed_out = True
                                 break
 
                             combo_str = json.dumps(combo) if combo else "{}"
-                            log.info(f"  [{idx}/{len(param_combos)}] params={combo_str}")
+                            log.info(f"[{idx}/{len(param_combos)}] params={combo_str}")
 
                             r = await fill_cache(
                                 engine_vlad, candles,
                                 service_url, pair, day, combo, deadline,
                             )
-                            new = r["done"] - r["skipped"] - r["errors"]
-                            stats_cache["new"]     += new
-                            stats_cache["skipped"] += r["skipped"]
-                            stats_cache["errors"]  += r["errors"]
+                            pair_cache["new"]     += r["new"]
+                            pair_cache["skipped"] += r["skipped"]
+                            pair_cache["errors"]  += r["errors"]
+                            global_cache["new"]     += r["new"]
+                            global_cache["skipped"] += r["skipped"]
+                            global_cache["errors"]  += r["errors"]
                             log.info(
-                                f"  ✓ total={r['total']}  new={new}  "
+                                f"✓ total={r['total']}  new={r['new']}  "
                                 f"skip={r['skipped']}  err={r['errors']}"
                             )
 
@@ -745,9 +745,9 @@ async def run(args) -> None:
                             send_trace(
                                 f"✅ Кеш завершён — pair={pair} day={day} model={model_id}",
                                 f"pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}\n"
-                                f"new={stats_cache['new']}  "
-                                f"skipped={stats_cache['skipped']}  "
-                                f"errors={stats_cache['errors']}\n"
+                                f"new={pair_cache['new']}  "
+                                f"skipped={pair_cache['skipped']}  "
+                                f"errors={pair_cache['errors']}\n"
                                 f"Прошло: {deadline.elapsed_str()}  "
                                 f"Осталось: {deadline.remaining_str()}",
                             )
@@ -764,17 +764,22 @@ async def run(args) -> None:
                             break
 
                         log.info(
-                            f"\n  🧪 Бэктест tier={tier} "
+                            f"\n🧪 Бэктест tier={tier} "
                             f"({len(param_combos)} комбинаций)..."
                         )
-                        results = []
+
+                        # BUG FIX 6: локальные счётчики для текущего тира
+                        tier_results = []
+                        tier_skipped = 0
+                        tier_failed  = 0
+
                         for idx, combo in enumerate(param_combos, 1):
                             if deadline.exceeded():
                                 timed_out = True
                                 break
 
                             combo_str = json.dumps(combo) if combo else "{}"
-                            log.info(f"  [{idx}/{len(param_combos)}] params={combo_str}")
+                            log.info(f"[{idx}/{len(param_combos)}] params={combo_str}")
 
                             r = await run_backtest(
                                 engine_vlad, candles,
@@ -784,23 +789,25 @@ async def run(args) -> None:
                             )
 
                             if r.get("skipped"):
-                                stats_backtest["skipped"] += 1
+                                tier_skipped += 1
+                                global_backtest["skipped"] += 1
                                 log.info(
-                                    f"  ⏭  уже посчитано: "
+                                    f"⏭  уже посчитано: "
                                     f"score={r['value_score']}  "
                                     f"acc={r['accuracy']}"
                                 )
                             elif "error" in r:
-                                stats_backtest["failed"] += 1
+                                tier_failed += 1
+                                global_backtest["failed"] += 1
                                 log.info(
-                                    f"  ✗ {r['error']} "
+                                    f"✗ {r['error']} "
                                     f"(trades={r.get('trade_count', 0)})"
                                 )
                             else:
-                                stats_backtest["done"] += 1
-                                results.append(r)
+                                tier_results.append(r)
+                                global_backtest["done"] += 1
                                 log.info(
-                                    f"  ✓ score={r['value_score']:>10.2f}  "
+                                    f"✓ score={r['value_score']:>10.2f}  "
                                     f"acc={r['accuracy']:.3f}  "
                                     f"trades={r['trade_count']}"
                                 )
@@ -810,17 +817,18 @@ async def run(args) -> None:
                             pair, day, tier, date_from, date_to,
                         )
 
+                        # BUG FIX 7: логируем локальные счётчики тира (не глобальные)
                         log.info(
-                            f"\n  📊 tier={tier}: "
-                            f"done={len(results)}  "
-                            f"skip={stats_backtest['skipped']}  "
-                            f"fail={stats_backtest['failed']}"
+                            f"\n📊 tier={tier}: "
+                            f"done={len(tier_results)}  "
+                            f"skip={tier_skipped}  "
+                            f"fail={tier_failed}"
                         )
 
-                        if results:
-                            best = max(results, key=lambda x: x["value_score"])
+                        if tier_results:
+                            best = max(tier_results, key=lambda x: x["value_score"])
                             log.info(
-                                f"  🏆 Лучший: "
+                                f"🏆 Лучший: "
                                 f"score={best['value_score']}  "
                                 f"acc={best['accuracy']}  "
                                 f"trades={best['trade_count']}  "
@@ -828,15 +836,17 @@ async def run(args) -> None:
                             )
 
                         if not timed_out:
-                            best_score = max((r["value_score"] for r in results), default=0)
+                            best_score = max(
+                                (r["value_score"] for r in tier_results), default=0
+                            )
                             send_trace(
                                 f"✅ Бэктест завершён — pair={pair} day={day} "
                                 f"tier={tier} model={model_id}",
                                 f"pair={PAIR_NAMES.get(pair)}  "
                                 f"day={DAY_NAMES.get(day)}  tier={tier}\n"
-                                f"done={len(results)}  "
-                                f"skip={stats_backtest['skipped']}  "
-                                f"fail={stats_backtest['failed']}\n"
+                                f"done={len(tier_results)}  "
+                                f"skip={tier_skipped}  "
+                                f"fail={tier_failed}\n"
                                 f"best_score={best_score}\n"
                                 f"Прошло: {deadline.elapsed_str()}  "
                                 f"Осталось: {deadline.remaining_str()}",
@@ -848,22 +858,18 @@ async def run(args) -> None:
                 if timed_out:
                     break
 
-            # Конец цикла по парам/дням для текущей модели
-
-        # Конец цикла по моделям
-
         elapsed = deadline.elapsed_str()
 
         if timed_out:
             msg = (
                 f"⏰ Скрипт остановлен по таймауту ({args.timeout_hours}h).\n"
                 f"Прошло: {elapsed}\n\n"
-                f"Кеш  : new={stats_cache['new']}  "
-                f"skip={stats_cache['skipped']}  "
-                f"err={stats_cache['errors']}\n"
-                f"Бэктест: done={stats_backtest['done']}  "
-                f"skip={stats_backtest['skipped']}  "
-                f"fail={stats_backtest['failed']}\n\n"
+                f"Кеш  : new={global_cache['new']}  "
+                f"skip={global_cache['skipped']}  "
+                f"err={global_cache['errors']}\n"
+                f"Бэктест: done={global_backtest['done']}  "
+                f"skip={global_backtest['skipped']}  "
+                f"fail={global_backtest['failed']}\n\n"
                 f"Обработано моделей: {MODEL_IDS}"
             )
             log.warning(f"\n{msg}")
@@ -872,12 +878,12 @@ async def run(args) -> None:
             msg = (
                 f"✅ Расчёт завершён полностью.\n"
                 f"Прошло: {elapsed}\n\n"
-                f"Кеш  : new={stats_cache['new']}  "
-                f"skip={stats_cache['skipped']}  "
-                f"err={stats_cache['errors']}\n"
-                f"Бэктест: done={stats_backtest['done']}  "
-                f"skip={stats_backtest['skipped']}  "
-                f"fail={stats_backtest['failed']}\n\n"
+                f"Кеш  : new={global_cache['new']}  "
+                f"skip={global_cache['skipped']}  "
+                f"err={global_cache['errors']}\n"
+                f"Бэктест: done={global_backtest['done']}  "
+                f"skip={global_backtest['skipped']}  "
+                f"fail={global_backtest['failed']}\n\n"
                 f"Обработано моделей: {MODEL_IDS}"
             )
             log.info(f"\n{'='*55}")
